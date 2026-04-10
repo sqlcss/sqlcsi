@@ -1,3 +1,13 @@
+---
+name: dump-analysis
+description: >-
+  Generate WinDbg Mirrors commands for SQL Server crash dump analysis. Maps errors
+  to subsystem-specific ring buffers and DMV-equivalent commands. Use when the user
+  says "analyze dump", "分析 dump", provides a .mdmp file path, or asks to generate
+  WinDbg commands for a SQL Server dump.
+context: fork
+---
+
 # Dump Analysis Skill
 
 ## Overview

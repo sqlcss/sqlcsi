@@ -1,3 +1,13 @@
+---
+name: source-search
+description: >-
+  Search SQL Server engine source code in Azure DevOps for error definitions, raising
+  code, function logic, and XEvent diagnostics. Use when the user says "search error XXXX",
+  "查错误", wants to understand what source code raises a specific error number, or needs
+  to find trace flag definitions. Supports SQL 2017/2019/2022/2025.
+tools: ['shell', 'read', 'search', 'edit', 'msdata/*']
+---
+
 # Source Code Search Skill
 
 ## Overview
