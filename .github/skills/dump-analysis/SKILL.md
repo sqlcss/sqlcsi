@@ -285,7 +285,7 @@ Flag:
 - MEDIUM: {error_number} (in ring buffer, no call stack)
 ```
 
-Save to `C:\Users\lduan\.claude\sql-csi\reports\{case_id}_dump_findings.md`
+Save to `reports/{case_id}_dump_findings.md` (workspace-relative path).
 
 ---
 

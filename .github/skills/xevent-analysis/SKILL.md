@@ -28,8 +28,9 @@ Detect file type by name:
 
 #### Script Location
 ```
-C:\Users\lduan\.claude\sql-csi\scripts\extract_xel.ps1
+scripts/extract_xel.ps1
 ```
+(workspace-relative; resolve from the sqlcsi workspace root)
 
 #### Prerequisites
 The script auto-installs the `SqlServer` PowerShell module if not present.
@@ -41,16 +42,16 @@ Install-Module SqlServer -Scope CurrentUser -Force
 #### Usage
 ```bash
 # Single file
-powershell -File sql-csi/scripts/extract_xel.ps1 -Path "system_health_0_xxx.xel" -Output events.json
+powershell -File scripts/extract_xel.ps1 -Path "system_health_0_xxx.xel" -Output reports/events.json
 
 # Multiple files (glob)
-powershell -File sql-csi/scripts/extract_xel.ps1 -Path "system_health*.xel" -Output events.json
+powershell -File scripts/extract_xel.ps1 -Path "system_health*.xel" -Output reports/events.json
 
 # With time filter
-powershell -File sql-csi/scripts/extract_xel.ps1 -Path "*.xel" -Days 3 -Output events.json
+powershell -File scripts/extract_xel.ps1 -Path "*.xel" -Days 3 -Output reports/events.json
 
 # UNC path
-powershell -File sql-csi/scripts/extract_xel.ps1 -Path "\\server\share\system_health*.xel" -Output events.json
+powershell -File scripts/extract_xel.ps1 -Path "\\server\share\system_health*.xel" -Output reports/events.json
 ```
 
 #### Output Format
@@ -75,19 +76,20 @@ The script produces a JSON file with this structure:
 
 #### Script Location
 ```
-C:\Users\lduan\.claude\sql-csi\scripts\parse_xevent.js
+scripts/parse_xevent.js
 ```
+(workspace-relative; resolve from the sqlcsi workspace root)
 
 #### Usage
 ```bash
 # Console summary
-node sql-csi/scripts/parse_xevent.js events.json
+node scripts/parse_xevent.js reports/events.json
 
 # With time filter + JSON output
-node sql-csi/scripts/parse_xevent.js events.json --days 3 --json --output xevent_findings.json
+node scripts/parse_xevent.js reports/events.json --days 3 --json --output reports/xevent_findings.json
 
 # Cross-correlate with ERRORLOG findings
-node sql-csi/scripts/parse_xevent.js events.json --errorlog errorlog_findings.json --json --output xevent_findings.json
+node scripts/parse_xevent.js reports/events.json --errorlog reports/errorlog_findings.json --json --output reports/xevent_findings.json
 ```
 
 #### What the Script Analyzes
@@ -160,7 +162,7 @@ timestamps and raw XML for detailed analysis.
 When both ERRORLOG and XEvent data are available, use `--errorlog` to cross-correlate:
 
 ```bash
-node sql-csi/scripts/parse_xevent.js events.json --errorlog errorlog_7days_findings.json
+node scripts/parse_xevent.js reports/events.json --errorlog reports/errorlog_7days_findings.json
 ```
 
 The correlation output shows:
@@ -242,27 +244,28 @@ Use the same `--days` value from Step 0 for both ERRORLOG and XEvent:
 
 ```bash
 # Step 1: ERRORLOG parsing (already done in Step 1)
-node parse_errorlog.js <errorlog_files> --days {N} --json --output {case_id}_errorlog_findings.json
+node scripts/parse_errorlog.js <errorlog_files> --days {N} --json --output reports/{case_id}_errorlog_findings.json
 
 # Step 2: Extract XEL files from same directory
-powershell -File extract_xel.ps1 -Path "{xel_dir}\system_health*.xel" -Days {N} -Output {case_id}_xevent_extract.json
+powershell -File scripts/extract_xel.ps1 -Path "{xel_dir}\system_health*.xel" -Days {N} -Output reports/{case_id}_xevent_extract.json
 
 # Step 3: XEvent analysis with cross-correlation
-node parse_xevent.js {case_id}_xevent_extract.json --errorlog {case_id}_errorlog_findings.json --json --output {case_id}_xevent_findings.json
+node scripts/parse_xevent.js reports/{case_id}_xevent_extract.json --errorlog reports/{case_id}_errorlog_findings.json --json --output reports/{case_id}_xevent_findings.json
 
 # Step 4: Generate merged HTML report
-node gen_merged_report.js {case_id}_errorlog_findings.json {case_id}_xevent_findings.json {case_id}_merged_report.html
+node scripts/gen_merged_report.js reports/{case_id}_errorlog_findings.json reports/{case_id}_xevent_findings.json reports/{case_id}_merged_report.html
 ```
 
 #### 5.3.2 Merged Report Script
 
 ```
-C:\Users\lduan\.claude\sql-csi\scripts\gen_merged_report.js
+scripts/gen_merged_report.js
 ```
+(workspace-relative; resolve from the sqlcsi workspace root)
 
 Usage:
 ```bash
-node gen_merged_report.js <errorlog_findings.json> <xevent_findings.json> <output.html>
+node scripts/gen_merged_report.js <errorlog_findings.json> <xevent_findings.json> <output.html>
 ```
 
 The merged report includes 8 sections:

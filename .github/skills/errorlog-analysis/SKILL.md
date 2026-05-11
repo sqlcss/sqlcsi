@@ -81,23 +81,24 @@ multi-line messages, pattern detection, and priority assignment automatically.
 ### 1.1 Script Location
 
 ```
-C:\Users\lduan\.claude\sql-csi\scripts\parse_errorlog.js
+scripts/parse_errorlog.js
 ```
+(workspace-relative; resolve from the sqlcsi workspace root)
 
 ### 1.2 Usage
 
 ```bash
 # Single file
-node sql-csi/scripts/parse_errorlog.js <errorlog_path>
+node scripts/parse_errorlog.js <errorlog_path>
 
 # Multiple files (oldest first — script auto-sorts by number)
-node sql-csi/scripts/parse_errorlog.js ERRORLOG ERRORLOG.1 ERRORLOG.2 ... ERRORLOG.12
+node scripts/parse_errorlog.js ERRORLOG ERRORLOG.1 ERRORLOG.2 ... ERRORLOG.12
 
 # With JSON output saved to file
-node sql-csi/scripts/parse_errorlog.js <files> --json --output findings.json
+node scripts/parse_errorlog.js <files> --json --output reports/findings.json
 
 # With time range filter
-node sql-csi/scripts/parse_errorlog.js <files> --from "2021-05-02 03:00" --to "2021-05-02 04:00"
+node scripts/parse_errorlog.js <files> --from "2021-05-02 03:00" --to "2021-05-02 04:00"
 ```
 
 ### 1.3 What the Script Does
@@ -258,10 +259,10 @@ The script outputs a complete findings report. Save it:
 
 ```bash
 # JSON for programmatic use by downstream workflows
-node parse_errorlog.js <files> --json --output C:\Users\lduan\.claude\sql-csi\reports\{case_id}_errorlog_findings.json
+node scripts/parse_errorlog.js <files> --json --output reports/{case_id}_errorlog_findings.json
 
 # Console for human review
-node parse_errorlog.js <files> 2>/dev/null
+node scripts/parse_errorlog.js <files> 2>/dev/null
 ```
 
 ### 5.2 If Manual Parsing Was Used

@@ -1,3 +1,7 @@
 reports/
 *.json
 xel_local/
+
+# Keep VS Code workspace settings tracked
+!.vscode/
+!.vscode/**

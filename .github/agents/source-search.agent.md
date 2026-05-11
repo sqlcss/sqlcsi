@@ -5,7 +5,6 @@ description: >-
   code, function logic, and XEvent diagnostics. Use when the user says "search error XXXX",
   "查错误", wants to understand what source code raises a specific error number, or needs
   to find trace flag definitions. Supports SQL 2017/2019/2022/2025.
-tools: ['shell', 'read', 'search', 'edit', 'msdata/*']
 ---
 
 # Source Code Search Skill
@@ -286,7 +285,7 @@ Suggested session:
 
 If `case_id` is provided, generate HTML report at:
 ```
-C:\Users\lduan\.claude\sql-csi\reports\error_{XXXX}_{sql_version}.html
+reports/error_{XXXX}_{sql_version}.html
 ```
 
 Follow the HTML styling rules defined in the main agent file.
@@ -304,7 +303,7 @@ Report sections:
 
 Open in browser after generation:
 ```powershell
-Start-Process 'C:\Users\lduan\.claude\sql-csi\reports\error_{XXXX}_{sql_version}.html'
+Start-Process 'reports/error_{XXXX}_{sql_version}.html'
 ```
 
 ### 8.3 For Workflow 4 (Programmatic Return)

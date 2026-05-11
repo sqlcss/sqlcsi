@@ -1,0 +1,112 @@
+{
+  "servers": {
+    "mssql": {
+      "type": "local",
+      "command": "npx",
+      "args": ["-y", "mssql-mcp-server"],
+      "env": {
+        "MSSQL_SERVER": "localhost",
+        "MSSQL_DATABASE": "master",
+        "MSSQL_WINDOWS_AUTH": "true"
+      }
+    },
+    "csswiki": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@azure-devops/mcp@next", "Supportability"]
+    },
+    "msdata": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@azure-devops/mcp@next", "msdata"]
+    },
+    "microsoft-learn": {
+      "type": "http",
+      "url": "https://learn.microsoft.com/api/mcp"
+    },
+    "enghub": {
+      "type": "stdio",
+      "command": "enghub-mcp",
+      "args": ["start"]
+    },
+    "azure-mcp": {
+      "type": "stdio",
+      "command": "azmcp",
+      "args": ["server", "start", "--namespace", "kusto"]
+    },
+    "SqlOps": {
+      "type": "http",
+      "url": "https://sqlops-mcp.azurewebsites.net/"
+    },
+    "bluebird-mcp-sql": {
+      "type": "http",
+      "url": "https://mcp.bluebird-ai.net/",
+      "headers": {
+        "x-mcp-ec-organization": "msdata",
+        "x-mcp-ec-project": "Database Systems",
+        "x-mcp-ec-repository": "DsMainDev",
+        "x-mcp-ec-branch": "master",
+        "x-mcp-ec-mode": "mini+full"
+      }
+    },
+    "bluebird-mcp-2022": {
+      "type": "http",
+      "url": "https://mcp.bluebird-ai.net/",
+      "headers": {
+        "x-mcp-ec-organization": "msdata",
+        "x-mcp-ec-project": "Database Systems",
+        "x-mcp-ec-repository": "DsMainDev",
+        "x-mcp-ec-branch": "rel/box/sql2022/sql2022_rtm_qfe-cu",
+        "x-mcp-ec-mode": "mini+full"
+      }
+    },
+    "bluebird-mcp-2025": {
+      "type": "http",
+      "url": "https://mcp.bluebird-ai.net/",
+      "headers": {
+        "x-mcp-ec-organization": "msdata",
+        "x-mcp-ec-project": "Database Systems",
+        "x-mcp-ec-repository": "DsMainDev",
+        "x-mcp-ec-branch": "rel/box/sql2025/sql2025_rtm_qfe-cu",
+        "x-mcp-ec-mode": "mini+full"
+      }
+    },
+    "bluebird-mcp-2019": {
+      "type": "http",
+      "url": "https://mcp.bluebird-ai.net/",
+      "headers": {
+        "x-mcp-ec-organization": "msdata",
+        "x-mcp-ec-project": "Database Systems",
+        "x-mcp-ec-repository": "sql2019",
+        "x-mcp-ec-branch": "rel/box/sql2019/sql2019_rtm_qfe-cu",
+        "x-mcp-ec-mode": "mini+full"
+      }
+    },
+    "bluebird-mcp-2017": {
+      "type": "http",
+      "url": "https://mcp.bluebird-ai.net/",
+      "headers": {
+        "x-mcp-ec-organization": "msdata",
+        "x-mcp-ec-project": "Database Systems",
+        "x-mcp-ec-repository": "SQL2017",
+        "x-mcp-ec-branch": "rel/box/sql2017/sql2017_rtm_gdr",
+        "x-mcp-ec-mode": "mini+full"
+      }
+    },
+    "bluebird-mcp-2016": {
+      "type": "http",
+      "url": "https://mcp.bluebird-ai.net/",
+      "headers": {
+        "x-mcp-ec-organization": "msdata",
+        "x-mcp-ec-project": "Database Systems",
+        "x-mcp-ec-repository": "SQL2016",
+        "x-mcp-ec-branch": "rel/box/sql2016/sql2016_sp3_gdr",
+        "x-mcp-ec-mode": "mini+full"
+      }
+    },
+    "icm-prod": {
+      "type": "http",
+      "url": "https://icm-mcp-prod.azure-api.net/v1/"
+    }
+  }
+}
