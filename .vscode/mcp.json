@@ -5,9 +5,7 @@
       "command": "npx",
       "args": ["-y", "mssql-mcp-server"],
       "env": {
-        "MSSQL_SERVER": "localhost",
-        "MSSQL_DATABASE": "master",
-        "MSSQL_WINDOWS_AUTH": "true"
+        "MSSQL_CONNECTION_STRING": "Server=localhost;Database=xevent_analyze;User Id=sqlcsi;Password=SqlCsi#2026!;TrustServerCertificate=true"
       }
     },
     "csswiki": {
@@ -24,7 +22,7 @@
       "type": "http",
       "url": "https://learn.microsoft.com/api/mcp"
     },
-    "enghub": {
+   "enghub": {
       "type": "stdio",
       "command": "enghub-mcp",
       "args": ["start"]

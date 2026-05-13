@@ -55,6 +55,8 @@ microsoft_code_sample_search(
   language: "sql"
 )
 ```
+Wait type classification reference: [.github/references/wait-types.md](../../references/wait-types.md)
+
 DMV topic mapping by subsystem:
 
 | Subsystem | DMV / Diagnostic Topic |
@@ -169,7 +171,7 @@ Agent: [并行调用 microsoft_docs_search × 2 + microsoft_code_sample_search �
 
 User: 执行诊断查询
 
-Agent: → 通过 MSSQL MCP 执行 DMV 查询...
+Agent: → 通过 sqlcmd 执行 DMV 查询...
 ```
 
 ---

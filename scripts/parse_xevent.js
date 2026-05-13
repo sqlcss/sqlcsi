@@ -424,7 +424,7 @@ function analyzeXEvents(data, options) {
     timeline.push({ timestamp: d.timestamp, icon: '[DEADLOCK]', description: 'Deadlock detected' });
   }
 
-  timeline.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  timeline.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
 
   // =====================================================================
   // Patterns

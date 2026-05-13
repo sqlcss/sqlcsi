@@ -5,6 +5,7 @@ description: >-
   Looks up KB fixes, CU applicability, diagnostic queries, and wait type root causes.
   Use after ERRORLOG/XEvent analysis identifies top issues, or when the user asks
   "research error XXXX", "look up KB for error", "what causes WRITELOG wait".
+tools: ['terminal', 'readFile', 'editFile', 'microsoft-learn/*', 'csswiki/*']
 ---
 
 # Microsoft Docs Lookup
@@ -167,7 +168,7 @@ Agent: [并行调用 microsoft_docs_search × 2 + microsoft_code_sample_search �
 
 User: 执行诊断查询
 
-Agent: → 通过 MSSQL MCP 执行 DMV 查询...
+Agent: → 通过 sqlcmd 执行 DMV 查询...
 ```
 
 ---

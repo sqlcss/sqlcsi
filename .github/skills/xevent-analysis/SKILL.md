@@ -10,318 +10,560 @@ context: fork
 
 # XEvent Analysis (system_health)
 
-## Step 4: XEvent Analysis (.xel files)
+## Overview
 
-XEvent analysis uses a two-phase pipeline: PowerShell extracts binary XEL → JSON,
-then Node.js analyzes the JSON. This runs **in parallel with** or **after** ERRORLOG
-parsing (Steps 1-3).
+Two analysis paths are available. Choose based on environment:
 
-### 4.0 Check Inputs
+| Path | Method | Speed | When to use |
+|------|--------|-------|-------------|
+| **A — SQL Server import** | `fn_xe_file_target_read_file` → physical tables → T-SQL queries | **Seconds** (200 MB XEL → ~30s) | Local SQL Server available (`sqlcmd`) |
+| **B — PowerShell + Node.js** | `extract_xel.ps1` → JSON → `parse_xevent.js` | **Minutes** (200 MB XEL → 5-15 min) | No local SQL Server |
 
-If the user provides `.xel` file paths (local or UNC), proceed to Step 4.1.
-Detect file type by name:
-- `system_health*.xel` → system_health session (default, richest data)
-- `AlwaysOn_health*.xel` → AG health session
-- Other `*.xel` → custom session
+**Always prefer Path A** when a SQL Server instance is accessible.
 
-### 4.1 Extract XEL → JSON (PowerShell)
+## Step 0: Check Inputs
 
-#### Script Location
+1. Detect XEL session type by filename:
+   - `system_health*.xel` → system_health (default, richest data)
+   - `AlwaysOn_health*.xel` → AG health session
+   - `*SQLDIAG*.xel` → sqldiag / component_health (different event names — see Known Limitations)
+   - Other `*.xel` → custom session
+
+2. Determine if a local SQL Server is available:
+   - Test `sqlcmd -S localhost -E -Q "SELECT 1"`
+   - If yes → Path A. If no → Path B.
+
+---
+
+## Path A: SQL Server Import (Recommended)
+
+### A.1 Run Import Script
+
+```
+scripts/import_xel_to_sql.sql
+```
+
+The script creates database `[xevent_analyze]` with schema `[xe]` and these physical tables:
+
+| Table | Contents | Key columns |
+|-------|----------|-------------|
+| `xe.raw_events` | All events with full XML | `case_id`, `event_name`, `event_time`, `event_data` (XML) |
+| `xe.errors` | Shredded `error_reported` | `error_number`, `severity`, `state`, `message`, `database_name`, `session_id` |
+| `xe.waits` | Shredded `wait_info` / `wait_info_external` | `wait_type`, `duration_ms`, `signal_duration_ms`, `wait_resource` |
+| `xe.diagnostics` | Shredded `sp_server_diagnostics_component_result` | `component`, `state_desc`, `data_xml` |
+| `xe.scheduler` | Shredded `scheduler_monitor_*` | `sql_cpu_pct`, `system_idle_pct`, `nonyielding_count` |
+| `xe.deadlocks` | Shredded `xml_deadlock_report` | `deadlock_xml` |
+| `xe.connectivity` | Shredded `connectivity_ring_buffer_recorded` | `error_code`, `conn_type` |
+
+**Usage:**
+```bash
+# Edit @xel_path, @days, @case_id at top of script, then:
+sqlcmd -S localhost -E -i scripts/import_xel_to_sql.sql
+```
+
+Configuration variables (lines 27-29 of script):
+```sql
+DECLARE @xel_path NVARCHAR(500) = N'C:\Temp\system_health_0_*.xel';
+DECLARE @days INT = 7;      -- 0 = all data
+DECLARE @case_id NVARCHAR(50) = N'{case_id}';
+```
+
+The script is **idempotent** — re-running with the same `case_id` deletes old rows first.
+Multiple cases can coexist in the same database (filtered by `case_id`).
+
+### A.2 Run Analysis Queries
+
+After import, query via `sqlcmd`. Since database is per-case (`[xevent_{case_id}]`),
+use `-d xevent_{case_id}` or `USE [xevent_{case_id}]` — no three-part names needed.
+
+**Top errors:**
+```sql
+SELECT error_number, severity, COUNT(*) AS cnt,
+       MIN(event_time) AS first_seen, MAX(event_time) AS last_seen
+FROM xe.errors WHERE case_id = '{case_id}'
+GROUP BY error_number, severity ORDER BY cnt DESC
+```
+
+**Top waits by total duration:**
+```sql
+SELECT wait_type, COUNT(*) AS cnt,
+       SUM(duration_ms) AS total_ms, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms,
+       SUM(signal_duration_ms) AS total_signal_ms
+FROM xe.waits WHERE case_id = '{case_id}'
+GROUP BY wait_type ORDER BY total_ms DESC
+```
+
+**sp_server_diagnostics WARNING/ERROR states:**
+```sql
+SELECT component, state_desc, COUNT(*) AS cnt,
+       MIN(event_time) AS first_seen, MAX(event_time) AS last_seen
+FROM xe.diagnostics
+WHERE case_id = '{case_id}' AND state_desc IN ('warning','error')
+GROUP BY component, state_desc ORDER BY cnt DESC
+```
+
+**Non-yielding and high-CPU scheduler events:**
+```sql
+SELECT event_name, event_time, sql_cpu_pct, system_idle_pct, scheduler_id, nonyielding_count
+FROM xe.scheduler
+WHERE case_id = '{case_id}'
+  AND (event_name LIKE '%non_yielding%' OR sql_cpu_pct > 75 OR nonyielding_count > 0)
+ORDER BY event_time
+```
+
+**Deadlocks:**
+```sql
+SELECT event_time, deadlock_xml FROM xe.deadlocks
+WHERE case_id = '{case_id}' ORDER BY event_time
+```
+
+**Connectivity summary:**
+```sql
+SELECT error_code, conn_type, COUNT(*) AS cnt
+FROM xe.connectivity WHERE case_id = '{case_id}'
+GROUP BY error_code, conn_type ORDER BY cnt DESC
+```
+
+**Ad-hoc: shred any event from raw XML** (example — `security_error_ring_buffer_recorded`):
+```sql
+SELECT event_time,
+       event_data.value('(event/data[@name="error_code"]/value)[1]', 'int') AS error_code,
+       event_data.value('(event/data[@name="api_name"]/value)[1]', 'nvarchar(100)') AS api_name
+FROM xe.raw_events
+WHERE case_id = '{case_id}' AND event_name = 'security_error_ring_buffer_recorded'
+ORDER BY event_time DESC
+```
+
+### A.3 Interpret Results
+
+#### Wait Analysis — Red Flag Thresholds
+
+See full reference: [.github/references/wait-types.md](../../references/wait-types.md) for benign/ignorable waits and the decision tree.
+
+| Wait type | Red flag | Root cause |
+|-----------|----------|-----------|
+| `RESOURCE_SEMAPHORE` | avg > 5000 ms or any occurrence | Queries waiting for memory grant — server memory pressure |
+| `LATCH_EX` / `LATCH_SH` | total > 10M ms | Non-buffer latch contention (ACCESS_METHODS_*, HOBT, etc.) |
+| `LCK_M_*` | max > 60000 ms | Long lock waits — blocking chains |
+| `PAGEIOLATCH_*` | avg > 15 ms | Storage I/O latency |
+| `ASYNC_IO_COMPLETION` | max > 60000 ms | Severe storage stall |
+| `WRITELOG` | avg > 5 ms | Transaction log write latency |
+| `THREADPOOL` | any occurrence | Worker thread exhaustion |
+| `PREEMPTIVE_OS_*` | avg > 5000 ms | External OS calls slow (AD, file system, etc.) |
+
+#### sp_server_diagnostics States
+
+| State | Meaning |
+|-------|---------|
+| clean | Healthy |
+| warning | Component under pressure — **investigate** |
+| error | Component failing — **critical, usually triggers AG failover** |
+
+#### Non-yielding Scheduler Events
+
+- Non-yielding with **low CPU** (< 30%) → thread stuck on I/O, latch, or memory grant (not CPU starvation)
+- Non-yielding with **high CPU** (> 75%) → CPU starvation, runaway query, or spinlock contention
+- **Multiple non-yielding in a short window** (< 5 min) → severe systemic issue
+
+---
+
+## Analysis Methodology (Path A)
+
+After importing data to `[xevent_analyze].[xe].*`, follow this structured analysis path.
+
+### Phase 1: Overview — What event types exist and how many?
+
+```sql
+SELECT event_name, COUNT(*) AS cnt FROM xe.raw_events
+WHERE case_id = '{case_id}' GROUP BY event_name ORDER BY cnt DESC
+```
+
+This tells you which tables will have data and which will be empty.
+If `security_error_ring_buffer_recorded` or `memory_broker_ring_buffer_recorded`
+dominate, they may be the key signal (not just noise).
+
+### Phase 2: Per-Table Analysis
+
+Analyze each shredded table in this order (highest signal first):
+
+#### 2.1 xe.errors — Error Landscape
+
+```sql
+-- Top errors by count
+SELECT error_number, severity, COUNT(*) AS cnt,
+       MIN(event_time) AS first_seen, MAX(event_time) AS last_seen
+FROM xe.errors WHERE case_id = '{case_id}'
+GROUP BY error_number, severity ORDER BY cnt DESC
+
+-- Hourly distribution (baseline vs event?)
+SELECT CAST(event_time AS DATE) AS day, DATEPART(HOUR, event_time) AS hr,
+       COUNT(*) AS cnt, SUM(CASE WHEN severity >= 20 THEN 1 ELSE 0 END) AS fatal
+FROM xe.errors WHERE case_id = '{case_id}'
+GROUP BY CAST(event_time AS DATE), DATEPART(HOUR, event_time) ORDER BY day, hr
+```
+
+**Look for:** Is error rate constant (baseline problem) or spiking at specific hours (event-driven)?
+
+#### 2.2 xe.waits — Wait Profile
+
+```sql
+-- Top waits by total duration (NOT by count)
+SELECT wait_type, COUNT(*) AS cnt,
+       SUM(duration_ms) AS total_ms, AVG(duration_ms) AS avg_ms,
+       MAX(duration_ms) AS max_ms, SUM(signal_duration_ms) AS total_signal_ms
+FROM xe.waits WHERE case_id = '{case_id}'
+GROUP BY wait_type ORDER BY total_ms DESC
+
+-- Hourly pattern for top wait type
+SELECT CAST(event_time AS DATE) AS day, DATEPART(HOUR, event_time) AS hr,
+       COUNT(*) AS cnt, SUM(duration_ms) AS total_ms
+FROM xe.waits WHERE case_id = '{case_id}' AND wait_type = '{top_wait}'
+GROUP BY CAST(event_time AS DATE), DATEPART(HOUR, event_time) ORDER BY day, hr
+
+-- Per-session distribution (1 big query or many concurrent?)
+SELECT session_id, COUNT(*) AS cnt, SUM(duration_ms) AS total_ms,
+       AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms
+FROM xe.waits WHERE case_id = '{case_id}' AND wait_type = '{top_wait}'
+GROUP BY session_id ORDER BY total_ms DESC
+```
+
+**Look for:**
+- Total duration matters more than count (1 wait of 1M ms > 1000 waits of 100 ms)
+- signal_duration_ms / total_ms ratio — if signal is high proportion, CPU scheduling is slow
+- Hourly spikes vs flat → periodic job vs persistent issue
+- Session distribution → 1-2 sessions = single bad query; 20+ sessions = systemic pressure
+
+#### 2.3 xe.diagnostics — Health State + Embedded Data
+
+```sql
+-- State distribution
+SELECT component, state_desc, COUNT(*) AS cnt,
+       MIN(event_time) AS first_seen, MAX(event_time) AS last_seen
+FROM xe.diagnostics WHERE case_id = '{case_id}'
+GROUP BY component, state_desc ORDER BY component, state_desc
+
+-- WARNING/ERROR records with data_xml
+SELECT event_time, component, state_desc, LEFT(data_xml, 3000) AS data_preview
+FROM xe.diagnostics
+WHERE case_id = '{case_id}' AND state_desc IN ('warning','error')
+ORDER BY event_time
+```
+
+**For QUERY_PROCESSING WARNING:** The `data_xml` contains `<blockingTasks>` with actual
+SQL text of blocking queries. This is direct evidence of what's causing pressure.
+
+**For RESOURCE WARNING:** See Memory Verification below.
+
+**For SYSTEM WARNING:** Check timing — if it starts *after* an AG failure, it's a symptom, not a cause.
+
+#### 2.4 xe.scheduler — CPU and Non-Yielding
+
+```sql
+SELECT event_name, event_time, sql_cpu_pct, system_idle_pct, nonyielding_count
+FROM xe.scheduler
+WHERE case_id = '{case_id}'
+  AND (event_name LIKE '%non_yielding%' OR sql_cpu_pct > 75 OR nonyielding_count > 0)
+ORDER BY event_time
+
+-- Hourly CPU trend
+SELECT CAST(event_time AS DATE) AS day, DATEPART(HOUR, event_time) AS hr,
+       AVG(sql_cpu_pct) AS avg_cpu, MAX(sql_cpu_pct) AS max_cpu,
+       SUM(CASE WHEN event_name LIKE '%non_yielding%' THEN 1 ELSE 0 END) AS ny_cnt
+FROM xe.scheduler WHERE case_id = '{case_id}'
+GROUP BY CAST(event_time AS DATE), DATEPART(HOUR, event_time) ORDER BY day, hr
+```
+
+**Look for:** Non-yielding events with low CPU → thread stuck (I/O, memory grant, latch), not CPU starvation.
+
+#### 2.5 xe.connectivity — Connection Errors
+
+```sql
+-- Error pattern
+SELECT sni_consumer_error, os_error, conn_type, tds_flags, COUNT(*) AS cnt
+FROM xe.connectivity WHERE case_id = '{case_id}'
+GROUP BY sni_consumer_error, os_error, conn_type, tds_flags ORDER BY cnt DESC
+
+-- Top source IPs
+SELECT remote_host, COUNT(*) AS cnt,
+       MIN(event_time) AS first_seen, MAX(event_time) AS last_seen
+FROM xe.connectivity WHERE case_id = '{case_id}' AND sni_consumer_error > 0
+GROUP BY remote_host ORDER BY cnt DESC
+```
+
+**Look for:**
+- `os_error = 10054` (connection reset by peer) → network/client issue
+- `os_error = 10060` (connection timeout) → network latency
+- `os_error = 109` (pipe ended) → named pipe disconnect
+- Concentrated on 1-2 IPs → client-specific problem; many IPs → server-side cause
+
+#### 2.6 xe.security_errors — Security API Failures
+
+```sql
+SELECT error_code, api_name, calling_api, COUNT(*) AS cnt
+FROM xe.security_errors WHERE case_id = '{case_id}'
+GROUP BY error_code, api_name, calling_api ORDER BY cnt DESC
+```
+
+**⚠️ CRITICAL: Always verify error_code meaning before assuming OOM:**
+```powershell
+[ComponentModel.Win32Exception]::new(<error_code>).Message
+```
+
+Common error codes in this table:
+| error_code | Actual meaning | NOT |
+|------------|---------------|-----|
+| 5023 | `ERROR_INVALID_STATE` — resource not in correct state | ~~ERROR_OUTOFMEMORY~~ |
+| 1332 | `ERROR_NO_SUCH_MEMBER` — AD account/group not found | — |
+| 0x8009030C | `SEC_E_LOGON_DENIED` — SSPI logon denied | — |
+| 0x80090301 | `SEC_E_INSUFFICIENT_MEMORY` — **this one IS memory** | — |
+
+#### 2.7 xe.memory_broker — Memory Trend
+
+```sql
+SELECT CAST(event_time AS DATE) AS day, DATEPART(HOUR, event_time) AS hr,
+       AVG(memory_ratio) AS avg_ratio, MIN(memory_ratio) AS min_ratio, COUNT(*) AS samples
+FROM xe.memory_broker WHERE case_id = '{case_id}'
+GROUP BY CAST(event_time AS DATE), DATEPART(HOUR, event_time)
+HAVING MIN(memory_ratio) < 90 ORDER BY day, hr
+```
+
+**Look for:** Periodic dips in memory_ratio correlating with RESOURCE_SEMAPHORE spikes.
+
+#### 2.8 xe.ag_events — AG State Changes (if sqldiag imported)
+
+```sql
+SELECT event_name, event_time, ag_name, reason, target_state, failure_condition
+FROM xe.ag_events WHERE case_id = '{case_id}' ORDER BY event_time
+```
+
+**Look for:** `reason = LEASEEXPIRED` → AG lease worker couldn't be scheduled in time.
+
+### Phase 3: Memory Verification (RESOURCE WARNING Deep-Dive)
+
+When `xe.diagnostics` shows RESOURCE WARNING, extract the embedded memory report
+from `xe.raw_events` XML to verify whether real OOM occurred.
+
+**Step 1 — Extract memory report:**
+```sql
+SELECT event_time,
+    event_data.value('(event/data[@name="data"]/value/resource/@lastNotification)[1]', 'nvarchar(50)') AS last_notification,
+    event_data.value('(event/data[@name="data"]/value/resource/@outOfMemoryExceptions)[1]', 'int') AS oom_exceptions,
+    event_data.value('(event/data[@name="data"]/value/resource/@isAnyPoolOutOfMemory)[1]', 'int') AS pool_oom,
+    event_data.value('(event/data[@name="data"]/value/resource/@processOutOfMemoryPeriod)[1]', 'int') AS oom_period
+FROM xe.raw_events
+WHERE case_id = '{case_id}' AND event_name LIKE '%diagnostics_component_result'
+  AND event_data.value('(event/data[@name="component"]/text)[1]', 'nvarchar(50)') = 'RESOURCE'
+  AND event_data.value('(event/data[@name="state"]/text)[1]', 'nvarchar(20)') = 'WARNING'
+ORDER BY event_time
+```
+
+If XPath extraction returns NULL (sqldiag uses `/value` instead of `/text`), read full XML:
+```sql
+SELECT event_time, CAST(event_data AS NVARCHAR(MAX)) AS full_xml
+FROM xe.raw_events
+WHERE case_id = '{case_id}' AND event_name = 'component_health_result'
+  AND event_data.value('(event/data[@name="component"]/value)[1]', 'nvarchar(50)') = 'resource'
+  AND event_data.value('(event/data[@name="state_desc"]/value)[1]', 'nvarchar(20)') = 'warning'
+ORDER BY event_time ASC
+```
+
+**Step 2 — Verify: OS-level or SQL-level pressure?**
+
+| Indicator | Value=1 means | Check |
+|-----------|--------------|-------|
+| `System physical memory low` | OS has low physical memory | OS-level problem |
+| `System physical memory high` | OS has plenty of memory | OS is fine |
+| `Process physical memory low` | SQL Server **process** sees low memory | SQL-internal pressure |
+| `Process virtual memory low` | VA space low (rare on 64-bit) | Usually not relevant |
+
+**Step 3 — Verify: SQL Server internal state**
+
+| Indicator | What to check |
+|-----------|--------------|
+| `Target Committed` vs `Current Committed` | Equal → SQL used all of max server memory |
+| `Locked Pages Allocated` | Large value → LPIM in use |
+| `Pages Free` | Trend over time: declining → pressure worsening |
+| `Available Physical Memory` | OS-level free — if large but Process low=1 → SQL hogging |
+
+**Step 4 — Verify: Did actual OOM happen?**
+
+| Indicator | If 0 | If > 0 |
+|-----------|------|--------|
+| `outOfMemoryExceptions` | No actual OOM in SQL process | Confirmed OOM |
+| `isAnyPoolOutOfMemory` | No pool exhausted | A memory pool ran out |
+| `processOutOfMemoryPeriod` | Not in OOM state | Duration of OOM state |
+| `Last OOM Factor` | No recent OOM | OOM occurred (check factor value) |
+
+**Step 5 — Decision:**
+```
+outOfMemoryExceptions = 0 AND isAnyPoolOutOfMemory = 0?
+├── YES → Memory pressure exists but NO actual OOM failure
+│   └── Look for RESOURCE_SEMAPHORE waits as the real symptom of memory pressure
+└── NO  → Confirmed OOM
+    └── Check which clerk/pool ran out, check max server memory vs physical RAM
+```
+
+**⚠️ Common Pitfall:** Do NOT assume `lastNotification = RESOURCE_MEMPHYSICAL_LOW`
+means "out of memory". It means the memory broker detected pressure, but the OOM
+counters tell you whether allocations actually **failed**. Also verify any
+`security_error` error codes — they may not be OOM-related (e.g. 5023 = invalid state).
+
+### Phase 4: Time-Axis Cross-Correlation
+
+Overlay all event types on the same hourly time axis:
+
+```sql
+SELECT day, hr,
+       MAX(rs_cnt) AS resource_sem, MAX(err_cnt) AS errors,
+       MAX(conn_cnt) AS conn_errors, MAX(sec_cnt) AS sec_errors,
+       MAX(avg_cpu) AS avg_cpu, MAX(ny_cnt) AS non_yielding,
+       MAX(warn_cnt) AS diag_warnings, MAX(min_ratio) AS mem_ratio_min
+FROM (
+    SELECT CAST(event_time AS DATE) day, DATEPART(HOUR,event_time) hr,
+           COUNT(*) rs_cnt, NULL err_cnt, NULL conn_cnt, NULL sec_cnt,
+           NULL avg_cpu, NULL ny_cnt, NULL warn_cnt, NULL min_ratio
+    FROM xe.waits WHERE case_id='{case_id}' AND wait_type='RESOURCE_SEMAPHORE'
+    GROUP BY CAST(event_time AS DATE), DATEPART(HOUR,event_time)
+    UNION ALL
+    SELECT CAST(event_time AS DATE), DATEPART(HOUR,event_time),
+           NULL, COUNT(*), NULL, NULL, NULL, NULL, NULL, NULL
+    FROM xe.errors WHERE case_id='{case_id}'
+    GROUP BY CAST(event_time AS DATE), DATEPART(HOUR,event_time)
+    -- ... add more UNION ALL for each table
+) x GROUP BY day, hr ORDER BY day, hr
+```
+
+**Look for:**
+- Patterns that **correlate** in time → likely same root cause
+- Patterns that are **constant** while others spike → independent baseline issue
+- Events that start **after** a failure → symptoms, not causes
+
+### Phase 5: Causal Chain Construction
+
+Work **backwards** from the final symptom:
+
+```
+1. What was the final symptom? (e.g. AG LEASEEXPIRED)
+2. What could cause lease expiry? → Lease worker not scheduled
+3. What blocks scheduling? → Non-yielding? CPU starvation? Memory grant wait?
+4. Is there evidence of that blocker? → Check xe.scheduler, xe.waits
+5. What caused the blocker? → Check xe.diagnostics data_xml for blocking queries
+6. Is it periodic or constant? → Check hourly distribution
+7. Are there independent baseline issues? → Check constant-rate events separately
+```
+
+**For each conclusion, record:**
+- **Evidence source** (which table, which query)
+- **Strength**: ✅ Direct evidence / ⚠️ Inference / ❌ Assumption
+- If inference, note what data would confirm or refute it
+
+---
+
+## Path B: PowerShell + Node.js (Fallback)
+
+Use when no local SQL Server is available.
+
+### B.1 Extract XEL → JSON (PowerShell)
+
 ```
 scripts/extract_xel.ps1
 ```
-(workspace-relative; resolve from the sqlcsi workspace root)
 
-#### Prerequisites
-The script auto-installs the `SqlServer` PowerShell module if not present.
-To install manually:
-```powershell
-Install-Module SqlServer -Scope CurrentUser -Force
-```
+Supports `-EventName` filter to skip irrelevant events (major performance improvement):
 
-#### Usage
 ```bash
-# Single file
-powershell -File scripts/extract_xel.ps1 -Path "system_health_0_xxx.xel" -Output reports/events.json
+# Filtered extraction (recommended — 3-5x faster)
+powershell -File scripts/extract_xel.ps1 `
+  -Path "C:\Temp\system_health*.xel" `
+  -Days 7 `
+  -EventName error_reported,wait_info,wait_info_external,sp_server_diagnostics_component_result,scheduler_monitor_system_health_ring_buffer_recorded,scheduler_monitor_non_yielding_ring_buffer_recorded,xml_deadlock_report,connectivity_ring_buffer_recorded `
+  -Output reports/{case_id}_xevent_extract.json
 
-# Multiple files (glob)
-powershell -File scripts/extract_xel.ps1 -Path "system_health*.xel" -Output reports/events.json
-
-# With time filter
-powershell -File scripts/extract_xel.ps1 -Path "*.xel" -Days 3 -Output reports/events.json
-
-# UNC path
-powershell -File scripts/extract_xel.ps1 -Path "\\server\share\system_health*.xel" -Output reports/events.json
+# Unfiltered (all events — slower, larger JSON)
+powershell -File scripts/extract_xel.ps1 -Path "*.xel" -Days 7 -Output reports/{case_id}_xevent_extract.json
 ```
 
-#### Output Format
-The script produces a JSON file with this structure:
-```json
-{
-  "extraction_date": "2021-05-07T23:11:15Z",
-  "source_files": ["system_health_0_xxx.xel", "system_health_0_yyy.xel"],
-  "total_events": 12345,
-  "events": [
-    {
-      "name": "error_reported",
-      "timestamp": "2021-05-02T03:05:42.04+00:00",
-      "fields": { "error_number": 19432, "severity": 16, "state": 0, "message": "..." },
-      "actions": { "session_id": 55, "database_name": "ICADB" }
-    }
-  ]
-}
-```
+**Note on `-EventName`:** When invoked via `powershell -File`, comma-separated values
+are passed as a single string. The script splits on commas internally — this is by design.
 
-### 4.2 Analyze XEvent JSON (Node.js)
+### B.2 Analyze XEvent JSON (Node.js)
 
-#### Script Location
 ```
 scripts/parse_xevent.js
 ```
-(workspace-relative; resolve from the sqlcsi workspace root)
-
-#### Usage
-```bash
-# Console summary
-node scripts/parse_xevent.js reports/events.json
-
-# With time filter + JSON output
-node scripts/parse_xevent.js reports/events.json --days 3 --json --output reports/xevent_findings.json
-
-# Cross-correlate with ERRORLOG findings
-node scripts/parse_xevent.js reports/events.json --errorlog reports/errorlog_findings.json --json --output reports/xevent_findings.json
-```
-
-#### What the Script Analyzes
-
-| Event Category | XEvent Names | Extracted Data |
-|---------------|-------------|----------------|
-| **Errors** | `error_reported` | error_number, severity, state, message |
-| **Waits** | `wait_info`, `wait_info_external` | wait_type, duration_ms, signal_ms |
-| **Scheduler** | `scheduler_monitor_*` | non-yielding, CPU %, idle %, I/O pending |
-| **Memory** | `memory_broker_ring_buffer_recorded`, `sp_server_diagnostics_component_result` | memory_ratio, target, notifications |
-| **Deadlocks** | `xml_deadlock_report` | deadlock XML graph |
-| **Connectivity** | `connectivity_ring_buffer_recorded`, `login_failed` | connection events |
-
-#### Output JSON Structure
-```json
-{
-  "analysis_type": "sql-csi-xevent",
-  "source": "system_health",
-  "time_range": { "first": "...", "last": "..." },
-  "error_summary": { "total_unique": N, "total_occurrences": M, "fatal_count": F },
-  "errors": [ { "error_number": 19432, "severity": 16, "count": 42, "subsystem": "HADR_ERROR2", ... } ],
-  "wait_analysis": {
-    "top_waits": [ { "wait_type": "HADR_LOGCAPTURE_SYNC", "total_duration_ms": 98234, "count": 42, "avg_ms": 2339, "category": "HADR" } ],
-    "wait_categories": { "HADR": 98234, "IO": 45000 }
-  },
-  "scheduler_events": { "non_yielding_count": 2, "non_yielding": [...] },
-  "memory_events": { "total": 10, "events": [...] },
-  "deadlocks": { "count": 1, "events": [...] },
-  "patterns": [...],
-  "timeline": [...],
-  "code_search_targets": [...],
-  "correlation": { "errors_in_both": [19432], "xevent_only_errors": [8645], "errorlog_only_errors": [1222] }
-}
-```
-
-### 4.3 Review XEvent Findings
-
-After the script runs, review:
-
-#### Error Events
-- Errors from XEvent may include errors **not logged** to ERRORLOG (lower severity, filtered by trace flags)
-- XEvent captures exact timestamp with microsecond precision vs ERRORLOG's centisecond
-
-#### Wait Analysis
-The script classifies waits into categories and shows top waits by total duration:
-
-| Wait Category | Wait Types | Indicates |
-|--------------|------------|-----------|
-| **CPU** | `SOS_SCHEDULER_YIELD`, `THREADPOOL`, `SOS_WORK_DISPATCHER` | CPU pressure or worker exhaustion |
-| **I/O** | `PAGEIOLATCH_*`, `WRITELOG`, `IO_COMPLETION`, `ASYNC_IO_COMPLETION` | Disk I/O bottleneck |
-| **Locking** | `LCK_M_*` | Lock contention |
-| **Latch** | `PAGELATCH_*`, `LATCH_*` | Page or non-page latch contention |
-| **Network** | `ASYNC_NETWORK_IO`, `NET_WAITFOR_PACKET` | Client-side network delay |
-| **Memory** | `RESOURCE_SEMAPHORE`, `CMEMTHREAD` | Memory grant waits |
-| **HADR** | `HADR_*`, `PWAIT_HADR_*` | AG synchronization/transport |
-| **Backup** | `BACKUP*`, `BACKUPIO` | Backup operations |
-| **Preemptive** | `PREEMPTIVE_OS_*` | External OS calls (AD, file system, etc.) |
-| **CLR** | `CLR_*`, `SQLCLR_*` | CLR execution |
-
-#### Scheduler Events
-Non-yielding scheduler events indicate a thread held a scheduler too long (> 5 seconds).
-Multiple non-yielding events in a short window suggest severe CPU or I/O pressure.
-
-#### Deadlocks
-`xml_deadlock_report` events contain the full deadlock graph XML. The script extracts
-timestamps and raw XML for detailed analysis.
-
-### 4.4 Merge with ERRORLOG Findings
-
-When both ERRORLOG and XEvent data are available, use `--errorlog` to cross-correlate:
 
 ```bash
-node scripts/parse_xevent.js reports/events.json --errorlog reports/errorlog_7days_findings.json
+# With ERRORLOG cross-correlation
+node scripts/parse_xevent.js reports/{case_id}_xevent_extract.json \
+  --errorlog reports/{case_id}_errorlog_findings.json \
+  --json --output reports/{case_id}_xevent_findings.json
 ```
 
-The correlation output shows:
-- **errors_in_both** — high confidence, confirmed by two independent sources
+Output JSON contains: `errors`, `wait_analysis`, `scheduler_events`, `deadlocks`,
+`patterns`, `timeline`, `correlation`.
+
+### B.3 Cross-Correlation
+
+The `--errorlog` flag produces:
+- **errors_in_both** — confirmed by two independent sources (high confidence)
 - **xevent_only_errors** — may be lower severity or suppressed from ERRORLOG
-- **errorlog_only_errors** — may not be captured by XEvent session configuration
+- **errorlog_only_errors** — not captured by XEvent session configuration
 
-Merge strategy for `code_search_targets`:
-1. Errors in both → boost priority (if MEDIUM, promote to HIGH)
-2. XEvent-only errors → add to investigation list
-3. Wait patterns → correlate with ERRORLOG timeline gaps (gaps may be caused by heavy waits)
+---
 
-### 4.5 Fallback — SQL Queries (When PowerShell Not Available)
+## Known Limitations
 
-If the `SqlServer` PowerShell module cannot be installed, generate SQL queries for the
-user to run on a SQL Server instance with access to the .xel files:
+### sqldiag / component_health sessions
 
-**Query A: Error events**
+Sessions named `*SQLDIAG*` or `*hadr_health*` use different event names than
+`system_health`. Notably:
+- `component_health_result` instead of `sp_server_diagnostics_component_result`
+- No `error_reported`, `wait_info`, `scheduler_monitor_*` events
+- Rich data (topWaits, blockingTasks, AG state) is embedded as **XML inside the
+  `data` field** of `component_health_result` events
+
+For these sessions:
+1. Path A with `xe.raw_events` is superior — you can write custom XQuery to shred
+   the embedded XML
+2. Path B's `parse_xevent.js` will return empty results for waits/errors/scheduler
+   (parser does not parse embedded XML payloads)
+
+### Event name inventory
+
+Before filtering, discover what events exist in the XEL:
 ```sql
-SELECT
-    DATEADD(mi, DATEDIFF(mi, GETUTCDATE(), GETDATE()),
-        event_data.value('(event/@timestamp)[1]', 'datetime2')) AS local_time,
-    event_data.value('(event/data[@name="error_number"]/value)[1]', 'int') AS error_number,
-    event_data.value('(event/data[@name="severity"]/value)[1]', 'int') AS severity,
-    event_data.value('(event/data[@name="state"]/value)[1]', 'int') AS state,
-    event_data.value('(event/data[@name="message"]/value)[1]', 'nvarchar(max)') AS message
-FROM (
-    SELECT CAST(event_data AS xml) AS event_data
-    FROM sys.fn_xe_file_target_read_file(N'{xel_path}', NULL, NULL, NULL)
-    WHERE object_name = 'error_reported'
-) x
-WHERE event_data.value('(event/data[@name="severity"]/value)[1]', 'int') >= 11
-ORDER BY local_time DESC;
+-- Path A
+SELECT event_name, COUNT(*) AS cnt FROM xe.raw_events
+WHERE case_id = '{case_id}' GROUP BY event_name ORDER BY cnt DESC
 ```
-
-**Query B: Wait info**
-```sql
-SELECT
-    DATEADD(mi, DATEDIFF(mi, GETUTCDATE(), GETDATE()),
-        event_data.value('(event/@timestamp)[1]', 'datetime2')) AS local_time,
-    event_data.value('(event/data[@name="wait_type"]/text)[1]', 'nvarchar(100)') AS wait_type,
-    event_data.value('(event/data[@name="duration"]/value)[1]', 'bigint') AS duration_ms,
-    event_data.value('(event/data[@name="signal_duration"]/value)[1]', 'bigint') AS signal_duration_ms
-FROM (
-    SELECT CAST(event_data AS xml) AS event_data
-    FROM sys.fn_xe_file_target_read_file(N'{xel_path}', NULL, NULL, NULL)
-    WHERE object_name IN ('wait_info', 'wait_info_external')
-) x
-WHERE event_data.value('(event/data[@name="duration"]/value)[1]', 'bigint') > 5000
-ORDER BY local_time DESC;
-```
-
-**Query C: Scheduler monitor**
-```sql
-SELECT
-    DATEADD(mi, DATEDIFF(mi, GETUTCDATE(), GETDATE()),
-        event_data.value('(event/@timestamp)[1]', 'datetime2')) AS local_time,
-    event_data.value('(event/data[@name="scheduler_id"]/value)[1]', 'int') AS scheduler_id,
-    event_data.value('(event/data[@name="process_utilization"]/value)[1]', 'int') AS cpu_pct,
-    event_data.value('(event/@name)[1]', 'nvarchar(100)') AS event_name
-FROM (
-    SELECT CAST(event_data AS xml) AS event_data
-    FROM sys.fn_xe_file_target_read_file(N'{xel_path}', NULL, NULL, NULL)
-    WHERE object_name LIKE 'scheduler_monitor%'
-) x
-ORDER BY local_time DESC;
+```bash
+# Path B (quick sample)
+powershell -Command "Import-Module SqlServer; Read-SqlXEvent -FileName 'file.xel' | Select-Object -First 500 | Group-Object Name | Sort-Object Count -Descending | Select-Object Name, Count"
 ```
 
 ---
 
+## Auto-Detect XEL Files
 
-### 5.3 Merge ERRORLOG + XEvent into Combined Report
-
-When both ERRORLOG and XEvent data are available, generate a merged HTML report:
-
-#### 5.3.1 Run XEvent Analysis with ERRORLOG Cross-Correlation
-
-Use the same `--days` value from Step 0 for both ERRORLOG and XEvent:
-
-```bash
-# Step 1: ERRORLOG parsing (already done in Step 1)
-node scripts/parse_errorlog.js <errorlog_files> --days {N} --json --output reports/{case_id}_errorlog_findings.json
-
-# Step 2: Extract XEL files from same directory
-powershell -File scripts/extract_xel.ps1 -Path "{xel_dir}\system_health*.xel" -Days {N} -Output reports/{case_id}_xevent_extract.json
-
-# Step 3: XEvent analysis with cross-correlation
-node scripts/parse_xevent.js reports/{case_id}_xevent_extract.json --errorlog reports/{case_id}_errorlog_findings.json --json --output reports/{case_id}_xevent_findings.json
-
-# Step 4: Generate merged HTML report
-node scripts/gen_merged_report.js reports/{case_id}_errorlog_findings.json reports/{case_id}_xevent_findings.json reports/{case_id}_merged_report.html
+When the user provides an ERRORLOG directory, automatically probe for:
 ```
-
-#### 5.3.2 Merged Report Script
-
+{errorlog_dir}/system_health*.xel
+{errorlog_dir}/AlwaysOn_health*.xel
+{errorlog_dir}/*SQLDIAG*.xel
 ```
-scripts/gen_merged_report.js
-```
-(workspace-relative; resolve from the sqlcsi workspace root)
+If found, inform the user and include in analysis.
 
-Usage:
-```bash
-node scripts/gen_merged_report.js <errorlog_findings.json> <xevent_findings.json> <output.html>
-```
+---
 
-The merged report includes 8 sections:
-1. **ERRORLOG Top Errors** — prioritized error table + patterns
-2. **XEvent Wait Analysis** — all wait events with timeline + summary by type
-3. **XEvent sp_server_diagnostics** — WARNING/ERROR state alerts only
-4. **XEvent Scheduler Monitor** — CPU>75% or Memory<80% alerts only
-5. **XEvent error_reported** — errors as ERRORLOG complement
-6. **Cross-Correlation** — errors in both / XEvent-only / ERRORLOG-only
-7. **Microsoft Docs Research** — KB fixes, wait type analysis, recommendations
-8. **Conclusions & Recommendations** — root cause chain + action items
+## Output to Orchestrator
 
-#### 5.3.3 Auto-Detect XEL Files
+When called from the `sql-csi` full-analysis pipeline, return:
 
-When the user provides an ERRORLOG directory, automatically look for `system_health*.xel`
-in the same directory:
-
-```bash
-# Check for XEL files alongside ERRORLOG
-ls {errorlog_dir}/system_health*.xel 2>/dev/null
-```
-
-If found, inform the user and include in analysis automatically.
-
-#### 5.3.4 Microsoft Docs Integration in Report
-
-During Step 7 (Microsoft Docs Lookup), the following research is performed and
-embedded in section 7 of the merged report:
-
-For **top ERRORLOG errors** (from `code_search_targets`):
-- Search for KB fixes and CU applicability
-- Official error description from errors reference docs
-- Known fix status (FIX_NOT_APPLIED / FIX_ALREADY_APPLIED / NO_KB_FOUND)
-
-For **top XEvent waits** (from `wait_analysis.wait_summary`):
-- Official wait type description from [I/O troubleshooting guide](https://learn.microsoft.com/troubleshoot/sql/database-engine/performance/troubleshoot-sql-io-performance)
-- Common causes and resolution steps
-- Threshold comparison (10-15ms normal, flag values above)
-
-Results are inserted into the HTML report as section 7 with links to source docs.
-
-### 5.4 Return to Orchestrator (Workflow 4)
-
-When called from Full CSI, the JSON output provides `code_search_targets` directly:
-
-```json
-{
-  "code_search_targets": [
-    { "error_number": 19432, "priority": "HIGH", "subsystem": "HADR_ERROR2", "severity": 16, "count": 52 },
-    { "error_number": 17836, "priority": "HIGH", "subsystem": "SERVICE", "severity": 20, "count": 56 }
-  ]
-}
-```
-
-The orchestrator proceeds to:
-1. **Step 6** → ask user which error to investigate
-2. **Step 7** → Microsoft Docs lookup (KB fixes, diagnostic queries)
-3. **Workflow 3** → source code search (if user requests deeper investigation)
+1. **Absolute paths** of output files (JSON findings, or note that data is in `[xevent_analyze]` database)
+2. **Top errors** with cross-correlation flags
+3. **Top waits** by total duration with red-flag annotations
+4. **sp_server_diagnostics** WARNING/ERROR summary
+5. **Non-yielding** event count + cluster timestamps
+6. **Deadlock** count
+7. **Anomalies** (session type mismatch, empty event categories, etc.)
 

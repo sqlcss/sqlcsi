@@ -4,9 +4,12 @@ description: >-
   Parse SQL Server ERRORLOG files to extract errors, build timelines, and detect patterns.
   Use when the user says "analyze errorlog", "parse errorlog", "分析 errorlog", provides
   a path to an ERRORLOG file, or says "what errors are in this log".
+tools: ['terminal', 'readFile', 'editFile']
 ---
 
 # ERRORLOG Analysis
+
+**Wait type classification reference**: [.github/references/wait-types.md](../references/wait-types.md) — use this to classify wait-related errors and filter benign waits.
 
 ## Overview
 

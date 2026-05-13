@@ -5,6 +5,7 @@ description: >-
   to subsystem-specific ring buffers and DMV-equivalent commands. Use when the user
   says "analyze dump", "分析 dump", provides a .mdmp file path, or asks to generate
   WinDbg commands for a SQL Server dump.
+tools: ['terminal', 'readFile', 'editFile']
 ---
 
 # Dump Analysis Skill
