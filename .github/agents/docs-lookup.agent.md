@@ -1,17 +1,123 @@
 ---
 name: docs-lookup
 description: >-
-  Research SQL Server errors and wait types using Microsoft Learn official documentation.
-  Looks up KB fixes, CU applicability, diagnostic queries, and wait type root causes.
+  Research SQL Server errors, wait types, latch classes, and technical topics using
+  multiple knowledge sources in parallel. Dispatches sub-agents to search different
+  MCP sources, saves results locally, then synthesizes findings.
   Use after ERRORLOG/XEvent analysis identifies top issues, or when the user asks
-  "research error XXXX", "look up KB for error", "what causes WRITELOG wait".
-tools: ['terminal', 'readFile', 'editFile', 'microsoft-learn/*', 'csswiki/*']
+  "research error XXXX", "look up KB for error", "what causes WRITELOG wait",
+  or when another agent passes a search query (e.g. latch class name).
+tools: [execute, read, edit, search, agent, microsoft-learn/*, csswiki/*, msdata/*, enghub/*]
 ---
 
-# Microsoft Docs Lookup
+# Multi-Source Docs Lookup
 
-Research SQL Server errors and wait types using official Microsoft Learn documentation.
-Finds KB fixes, checks CU applicability, and provides diagnostic queries.
+Research SQL Server topics by dispatching parallel searches across multiple knowledge sources,
+saving results locally, and synthesizing findings.
+
+## Search Sources
+
+| # | Source | MCP Tools | What it provides |
+|---|--------|-----------|-----------------|
+| 1 | Microsoft Learn | `microsoft-learn-*` | Official docs, KB articles, code samples |
+| 2 | CSS Wiki | `csswiki-search_wiki` | Internal TSGs, troubleshooting guides |
+| 3 | msdata Wiki | `msdata-search_wiki` | Internal engineering wiki |
+| 4 | EngHub | `enghub-search`, `enghub-fetch` | Engineering docs (eng.ms) |
+
+## Workflow
+
+### Step 1: Receive Search Query
+
+The query can come from:
+- User directly: "research error 19419", "what causes WRITELOG wait"
+- Another agent: latch skill passes `ACCESS_METHODS_DATASET_PARENT`
+- Orchestrator: passes top error numbers from ERRORLOG analysis
+
+### Step 2: Dispatch Parallel Searches
+
+For each source, use `runSubagent` with detailed search instructions.
+Each sub-agent:
+1. Searches its MCP source with the query
+2. Fetches the **top 3 most relevant** full page content
+3. Saves each fetched page to `reports/{case_id}_docs/{source}_{sanitized_title}.md`
+4. Returns: title, URL, brief summary, local file path
+
+**Output directory**: `reports/{case_id}_docs/`
+
+### Sub-Agent Instructions by Source
+
+**Microsoft Learn** (`microsoft-learn-*`):
+- `microsoft_docs_search(query)` → get URLs
+- `microsoft_docs_fetch(url)` → get full page markdown
+- Save to `reports/{case_id}_docs/learn_{title}.md`
+- Return URL: the learn.microsoft.com URL
+
+**CSS Wiki** (`csswiki-*`):
+- `csswiki-search_wiki(searchText, project: ["SQLServerWindows"])` → get results with paths
+- `csswiki-repo_get_file_content(project, repositoryId, path, version: "main", versionType: "Branch")` → fetch full page
+- Known wiki repositoryId: SQLServerWindows = `d33c9417-111f-4539-99c6-de85ae587620`
+- Save to `reports/{case_id}_docs/csswiki_{title}.md`
+- **Return URL**: `https://dev.azure.com/Supportability/{project}/_wiki/wikis/{wiki-name}/{page-path}`
+- ⚠️ Do NOT use `wiki_get_page_content` — often fails with 404. Use `repo_get_file_content`.
+
+**msdata Wiki** (`msdata-*`):
+- `msdata-search_wiki(searchText)` → get results
+- `msdata-repo_get_file_content(...)` → fetch full page if available
+- Save to `reports/{case_id}_docs/msdata_{title}.md`
+
+**EngHub** (`enghub-*`):
+- `enghub-search(query)` → get results
+- `enghub-fetch(url)` → get full page
+- Save to `reports/{case_id}_docs/enghub_{title}.md`
+
+### Step 3: Collect & Synthesize
+
+After all sub-agents complete:
+
+**Layer 1 — Summaries**: Read sub-agent return messages for titles + URLs + file paths.
+
+**Layer 2 — Selective read**: Pick the 3-5 most relevant saved files and read them.
+Prioritize: CSS Wiki TSGs > EngHub > msdata Wiki > Microsoft Learn.
+
+**Layer 3 — On-demand**: If caller needs deeper info, read additional files.
+
+### Step 4: Return to Caller
+
+Return format — **each finding MUST include original text excerpt + URL**:
+
+```
+## Docs Research: {query}
+
+### Source 1: Microsoft Learn
+1. [{title}]({url})
+   📄 Saved: reports/{case_id}_docs/learn_{title}.md
+   > {relevant paragraph quoted from the doc}
+
+2. [{title}]({url})
+   📄 Saved: reports/{case_id}_docs/learn_{title2}.md
+   > {relevant paragraph quoted from the doc}
+
+### Source 2: CSS Wiki
+1. [{title}]({wiki_url})
+   📄 Saved: reports/{case_id}_docs/csswiki_{title}.md
+   > {relevant paragraph quoted from the TSG}
+
+### Source 3: msdata / EngHub
+(same format)
+
+### Synthesis
+{Cross-reference analysis: consensus, conflicts, key takeaways}
+
+### Key Findings
+1. {Finding} — Source: [{title}]({url})
+2. {Finding} — Source: [{title}]({url})
+```
+
+**Rules:**
+- Every finding MUST include a quoted original paragraph (not just a summary)
+- Every finding MUST include a clickable URL
+- Every fetched doc MUST be saved to `reports/{case_id}_docs/`
+- CSS Wiki URLs follow format: `https://dev.azure.com/Supportability/{project}/_wiki/...`
 
 ## Required MCP Servers
 

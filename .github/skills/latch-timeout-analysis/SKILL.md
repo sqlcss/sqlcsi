@@ -106,9 +106,24 @@ After extracting all lines, perform this structured analysis:
   "If the stat field has 0x04 off, there is heavy contention... might be caused by
   server bottlenecks, such as insufficient hardware resources"
 
-**5. Latch class documentation lookup:**
-Use `microsoft-learn` MCP to search: `{LATCH_CLASS} SQL Server latch`
-Key classes and their meanings (from [sys.dm_os_latch_stats](https://learn.microsoft.com/sql/relational-databases/system-dynamic-management-views/sys-dm-os-latch-stats-transact-sql)):
+**5. Latch class documentation lookup — call `docs-lookup`:**
+
+After identifying the latch class, invoke the `docs-lookup` agent to search
+multiple knowledge sources in parallel:
+
+```
+runSubagent("docs-lookup") with query: "{LATCH_CLASS} SQL Server latch timeout"
+```
+
+The docs-lookup agent will search:
+- **Microsoft Learn** — official latch class description, Error 847 docs
+- **CSS Wiki** — internal TSGs for this latch class
+- **msdata Wiki** — engineering notes, known issues
+- **EngHub** — engineering documentation
+
+Results are saved to `reports/{case_id}_docs/` and a synthesis is returned.
+
+**Quick reference** — common latch classes (from [sys.dm_os_latch_stats](https://learn.microsoft.com/sql/relational-databases/system-dynamic-management-views/sys-dm-os-latch-stats-transact-sql)):
 
 | Class | Official Description | Common Scenario |
 |-------|---------------------|-----------------|
@@ -117,6 +132,9 @@ Key classes and their meanings (from [sys.dm_os_latch_stats](https://learn.micro
 | `ACCESS_METHODS_HOBT_COUNT` | "Synchronize access to HoBt page and row counters" | Concurrent DML on same table |
 | `ACCESS_METHODS_HOBT` | "Synchronize access to in-memory representation of a HoBt" | Hot table with high concurrency |
 | `ALLOC_FREESPACE_CACHE` | "Synchronize access to free space cache for heaps/BLOBs" | Concurrent heap inserts |
+
+The quick reference provides immediate context; the docs-lookup search provides
+TSGs, KBs, and deeper engineering knowledge specific to the identified class.
 
 ### Determine Analysis Time Window
 

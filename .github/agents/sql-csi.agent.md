@@ -21,7 +21,7 @@ investigation. Sub-agents are invoked via the `runSubagent` tool by name.
 | `errorlog-analysis` | Parse ERRORLOG | [skills/errorlog-analysis/SKILL.md](../skills/errorlog-analysis/SKILL.md) | — |
 | `import-xevent` | Import XEL → SQL Server tables | [skills/xevent-analysis/SKILL.md](../skills/xevent-analysis/SKILL.md) (Path A import) | `sqlcmd` |
 | `analyze-xevent` | Analyze imported XEvent data | [skills/xevent-analysis/SKILL.md](../skills/xevent-analysis/SKILL.md) (Phases 2-5) | `sqlcmd` |
-| `docs-lookup` | KB / wait type research | [skills/docs-lookup/SKILL.md](../skills/docs-lookup/SKILL.md) | `microsoft-learn` |
+| `docs-lookup` | Multi-source doc search (parallel) | [skills/docs-lookup/SKILL.md](../skills/docs-lookup/SKILL.md) | `microsoft-learn`, `csswiki`, `msdata`, `enghub` |
 | `dump-analysis` | WinDbg / Mirrors commands | [skills/dump-analysis/SKILL.md](../skills/dump-analysis/SKILL.md) | (WinDbg external) |
 | `source-search` | Engine source code search | inline in [agents/source-search.agent.md](source-search.agent.md) | `msdata` / `bluebird-mcp-*` |
 | `latch-timeout-analysis` | Latch timeout: ERRORLOG → XEvent → DumpViewer | [skills/latch-timeout-analysis/SKILL.md](../skills/latch-timeout-analysis/SKILL.md) | `sqlcmd` |
