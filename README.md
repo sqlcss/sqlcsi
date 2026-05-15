@@ -151,6 +151,55 @@ Open the `sqlcsi` folder in VS Code and use Copilot Chat:
 @sql-csi full analysis, errorlog is \\server\share\ERRORLOG, case ID SR12345
 ```
 
+### AG Failover Analysis — Quick Start
+
+**1. Prepare logs** — organize into per-host subdirectories:
+
+```
+C:\Temp\<case_id>\
+├── <old_primary_host>\          e.g. HKAZEPWDB0031\
+│   ├── *_AlwaysOn.OUT           (REQUIRED)
+│   ├── *_ERRORLOG*              (REQUIRED)
+│   ├── AlwaysOn_health*.xel     (REQUIRED)
+│   ├── *SQLDIAG*.xel            (REQUIRED)
+│   └── system_health*.xel       (optional)
+└── <new_primary_host>\          e.g. HKAZEPWDB0011\
+    └── (same files)
+```
+
+**2. Have a local SQL Server** — XEvent data is imported into a temp database (`ag_<case_id>`).
+Default connection: `localhost` with Windows auth. No special setup needed.
+
+**3. Invoke the agent** — provide the required parameters:
+
+```text
+@ag-failover-analysis 使用 ag-failover-analysis skill 分析 case <case_id>:
+- Case Dir: C:\Temp\<case_id>
+- Old Primary: <hostname>
+- New Primary: <hostname>
+- Date: YYYY-MM-DD
+- UTC Offset: +8
+- SQL Server: localhost
+```
+
+The agent runs 6 steps automatically:
+1. Parse AlwaysOn.OUT → `ag_schema.json`
+2. Extract ERRORLOG → `ag_errorlog_events.json` + `failover_incidents.json`
+3. Import XEvent → SQL database `ag_<case_id>`
+4. Merge ERRORLOG + XEvent → `merged_timeline.json`
+5. Generate per-FO reports → `reports/<case_id>_fo[1-3]_analysis.html/.md`
+6. If stuck DBs found → invoke `stuck-db-analysis` for deep-dive
+
+**4. Reports** — generated in `reports/`:
+
+| File | Content |
+|------|---------|
+| `<case_id>_fo1_analysis.html` | FO1 report (HTML, Catppuccin Mocha theme) |
+| `<case_id>_fo1_analysis.md` | FO1 report (Markdown) |
+| `<case_id>_fo2_analysis.html/.md` | FO2 report |
+| `<case_id>_fo3_analysis.html/.md` | FO3 report |
+| `<case_id>_fo3_stuck_analysis.md` | Stuck DB deep-dive (if applicable) |
+
 ## Standalone Scripts
 
 The scripts in [scripts/](scripts/) can also be used directly from the CLI:
