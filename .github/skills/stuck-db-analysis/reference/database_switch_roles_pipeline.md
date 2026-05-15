@@ -270,6 +270,47 @@ it holds `m_lock` → blocks ALL subsequent AG operations.**
 
 ---
 
+## 5b. S→P Transition: SECONDARY → PRIMARY (TransitionToLogging)
+
+When a SECONDARY database becomes PRIMARY, it does **NOT** need full restart.
+The normal path (Branch 3 in `TransitionToLogging`, line 3342):
+
+```
+TransitionToLogging()  [HadrDbMgrControl.cpp L3342]
+├─ Release X-lock (allow redo thread to run)
+├─ ResumeRedoThread()                        ← start redo thread
+├─ SignalTransitionToLogging()               ← signal AcceptLog → Logging
+│   └─ m_RedoSignal.Signal()                ← wakes redo worker
+├─ WaitForDbRecovery()                       ← wait for redo + undo
+│   └─ m_databaseRecoveredEvent.Wait(INFINITE)
+└─ FRequiresDbRestart(GetPru())  [L3227]
+   └─ IsChangeTrackingEnabled()   [recoveryunit.cpp L17146]
+      ├─ false → PersistAgConfiguration()    ← ★ NO restart, NO "Starting up"
+      └─ true  → BringDatabaseFullyOnline() ← ONLY Change Tracking triggers restart
+```
+
+**`FRequiresDbRestart` function body** (line 3227):
+```cpp
+BOOL HadrRecoveryCallbacks::FRequiresDbRestart(RecoveryUnit* pRecoveryUnit)
+{
+    BOOL fShouldRestart = FALSE;
+    fShouldRestart = pRecoveryUnit->IsChangeTrackingEnabled();
+    return fShouldRestart;
+}
+```
+
+**Key**: Unless Change Tracking is enabled, S→P has NO `ShutdownDb`/`StartupDb`
+and NO "Starting up database" ERRORLOG message.
+
+Branch 1 (full restart) in `TransitionToLogging` is entered only when:
+- PRU is NULL
+- StartupPhase ≤ Recovered
+- DB is damaged
+- Version mismatch (needs upgrade scripts)
+- TF `TRCFLG_RETAIL_FORCE_DB_RESTART_DURING_AG_FAILOVER` enabled
+
+---
+
 ## 6. Error Code Reference
 
 | Error | Constant | Source File | Description |
