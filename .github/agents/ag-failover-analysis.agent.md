@@ -6,7 +6,7 @@ description: >-
   step of the AG role transition pipeline. Use when databases are stuck in
   RESOLVING after AG failover, or when the user says "analyze AG failover",
   "AG databases stuck", "分析 AG failover".
-tools: [execute, read, edit, search]
+tools: [execute, read, edit, search, agent, todo, web, msdata/*, microsoft-learn/*, csswiki/*, bluebird-mcp-sql/*, bluebird-mcp-2022/*, bluebird-mcp-2025/*, bluebird-mcp-2019/*, bluebird-mcp-2017/*, bluebird-mcp-2016/*, icm-prod/*, enghub/*, azure-mcp/*]
 ---
 
 # AG Failover Analysis Agent
