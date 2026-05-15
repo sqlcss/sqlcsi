@@ -717,6 +717,33 @@ For cases with multiple failovers, compare:
 - Why did FO2 succeed (same DBs, same host) but FO3 fail?
 - What was different about the system state?
 
+### Phase 6b: Invoke stuck-db-analysis (Conditional)
+
+**Trigger condition:** Any FO has databases that did NOT recover (Category B or C).
+
+Check `failover_incidents.json`: for each FO, if any DB on the demoted host has
+`to_resolving` from PRIMARY but no `starting_up` → that DB is stuck.
+
+**When to invoke:**
+- At least 1 DB stuck at `AcquireXDbLockWithKill` (NQ rollback present) → Cat B
+- At least 1 DB stuck silently (no NQ rollback, no starting_up) → Cat C
+- All DBs recovered → **do NOT invoke** (skip to Phase 7)
+
+**How to invoke:**
+Read the stuck-db-analysis skill from `.github/skills/stuck-db-analysis/SKILL.md`.
+Before running analysis, read the pre-cached source code KB:
+- `.github/skills/stuck-db-analysis/reference/database_switch_roles_pipeline.md`
+- `.github/skills/stuck-db-analysis/reference/lock_dependency.md`
+
+**What it produces:**
+- Side-by-side comparison table: Cat A (recovered) vs Cat B vs Cat C representative DBs
+- Pipeline mapping: each ERRORLOG/XEvent line → source code step + line number
+- Background writer analysis: Ghost/QDS/CtCleanup LSN progression
+- Classification rationale with raw evidence
+- Dump collection recommendation
+
+Save to: `reports/{case_id}_fo{N}_stuck_analysis.md`
+
 ### Phase 7: Generate HTML Report
 
 Generate an HTML report using the Catppuccin Mocha dark theme.
