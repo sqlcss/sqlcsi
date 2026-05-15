@@ -1,0 +1,346 @@
+AG Failover Analysis — Quick Reference
+=======================================
+
+Sample Case: 2605110030000091
+  Old Primary: HKAZEPWDB0031 (lost PRIMARY role, databases stuck in RESOLVING)
+  New Primary: HKAZEPWDB0011 (took over as PRIMARY)
+  Case Dir:    C:\Temp\2605110030000091
+  Date:        2026-05-11
+
+1. COLLECT INFORMATION
+----------------------
+Before starting, gather from the user:
+
+  - Old primary hostname    e.g. HKAZEPWDB0031
+  - New primary hostname    e.g. HKAZEPWDB0011
+  - Case directory          e.g. C:\Temp\2605110030000091
+  - Investigation date      e.g. 2026-05-11  (YYYY-MM-DD, server local time)
+  - UTC offset              e.g. 8  (for UTC+8)
+  - Local SQL Server        e.g. localhost  (for XEvent import)
+
+2. FILE LAYOUT
+--------------
+All log files must be organized in per-host subdirectories:
+
+  C:\Temp\2605110030000091\
+  ├── HKAZEPWDB0031\                                  ← old primary
+  │   ├── HKAZEPWDB0031_MSSQLSERVER_1033_AlwaysOn.OUT       (REQUIRED)
+  │   ├── HKAZEPWDB0031_MSSQLSERVER_1033_ERRORLOG.1         (REQUIRED)
+  │   ├── AlwaysOn_health_0_*.xel                           (REQUIRED)
+  │   ├── HKAZEPWDB0031_MSSQLSERVER_SQLDIAG_*.xel           (REQUIRED)
+  │   ├── system_health_0_*.xel                             (OPTIONAL)
+  │   └── ...
+  ├── HKAZEPWDB0011\                                  ← new primary
+  │   ├── HKAZEPWDB0011_MSSQLSERVER_1033_AlwaysOn.OUT       (REQUIRED)
+  │   ├── HKAZEPWDB0011_MSSQLSERVER_1033_ERRORLOG           (REQUIRED)
+  │   ├── AlwaysOn_health_0_*.xel                           (REQUIRED)
+  │   ├── HKAZEPWDB0011_MSSQLSERVER_SQLDIAG_*.xel           (REQUIRED)
+  │   ├── system_health_0_*.xel                             (OPTIONAL)
+  │   └── ...
+  └── (output files saved here by scripts)
+
+Root-level files are ignored. Each host's data goes in its own subfolder.
+
+3. SCRIPTS
+----------
+All scripts are in:  scripts/ag-failover-analysis/
+
+Step 1 — Parse AlwaysOn.OUT → Build AG Schema
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Script:  scripts/ag-failover-analysis/parse_alwayson_out.js
+  Usage:   node scripts/ag-failover-analysis/parse_alwayson_out.js <case_dir> <old_host> <new_host>
+  Sample:  node scripts/ag-failover-analysis/parse_alwayson_out.js C:\Temp\2605110030000091 HKAZEPWDB0031 HKAZEPWDB0011
+
+  Input:
+    C:\Temp\2605110030000091\HKAZEPWDB0031\HKAZEPWDB0031_MSSQLSERVER_1033_AlwaysOn.OUT
+    C:\Temp\2605110030000091\HKAZEPWDB0011\HKAZEPWDB0011_MSSQLSERVER_1033_AlwaysOn.OUT
+
+  Output:
+    C:\Temp\2605110030000091\ag_schema.json
+
+  What it does:
+    - Parses fixed-width DMV output from AlwaysOn.OUT
+    - Extracts AG State (AG name, group_id, primary_replica)
+    - Extracts Replica State (role, availability_mode, failover_mode)
+    - Extracts Database State (database_name, database_id, sync_state)
+    - Detects Listener and DTC_SUPPORT configuration
+    - Builds AG → DB mapping for both replicas
+
+  Sample result (3 AGs, 49 DBs):
+    sybasehk-prod-intl-ag   Primary=HKAZEPWDB0011  Listener=YES  DTC=NO    DBs=29
+    sybasehk-prod-batch-ag  Primary=HKAZEPWDB0011  Listener=YES  DTC=YES   DBs=12
+    sybasehk-prod-ext-ag    Primary=HKAZEPWDB0015  Listener=YES  DTC=NO    DBs=8
+
+  Note: DTC_SUPPORT is not in AlwaysOn.OUT. Step 2 detects it from ERRORLOG
+  per-DB DTC RM init events and updates ag_schema.json accordingly.
+  In this case, all 12 batch-ag DBs have per-DB DTC resource managers.
+
+  ag_schema.json contains:
+    - old_primary.ags       — per-AG config (group_id, listener, DTC, replicas)
+    - old_primary.databases — array of {name, id, ag, sync_state, db_state}
+    - new_primary.ags       — same structure for new primary
+    - new_primary.databases
+    - summary               — AG count, DB count, quick overview
+
+Step 2 — Extract AG ERRORLOG Events
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Script:  scripts/ag-failover-analysis/extract_ag_errorlog.js
+  Usage:   node scripts/ag-failover-analysis/extract_ag_errorlog.js <case_dir> <target_date>
+  Sample:  node scripts/ag-failover-analysis/extract_ag_errorlog.js C:\Temp\2605110030000091 2026-05-11
+
+  Prereq:  ag_schema.json must exist (run Step 1 first)
+  Input:   (auto-discovered from ag_schema.json)
+    C:\Temp\2605110030000091\HKAZEPWDB0031\HKAZEPWDB0031_MSSQLSERVER_1033_ERRORLOG.1
+    C:\Temp\2605110030000091\HKAZEPWDB0011\HKAZEPWDB0011_MSSQLSERVER_1033_ERRORLOG
+
+  Output:
+    C:\Temp\2605110030000091\ag_errorlog_events.json
+    C:\Temp\2605110030000091\ag_timeline.txt
+
+  Sample result (9901 events across both hosts):
+    ag_role_change:     31   AG-level state transitions
+    db_role_change:    432   per-DB role changes
+    wsfc_cluster:      ---   WSFC/quorum/lease events
+    dtc:                54   DTC resource manager events
+    abort_kill:         49   ABORT_AFTER_WAIT session kills
+    nonqual_rollback: 4514   Error 35299 loops (aidcconfig + claims)
+    remote_harden:    1001   Remote harden failed
+    starting_up:       159   Database startup
+    resync_revert:    2791   Connection/resync/reverting
+    adr_version:       ---   ADR VersionCleaner (Error 22006)
+    errors:             10   Other AG errors
+    other_ag:          ---   Remaining AG events
+
+  What it does:
+    - Auto-detects encoding (UTF-16LE / UTF-8)
+    - Filters ERRORLOG entries on target_date matching AG-related patterns
+    - Categorizes events into:
+        ag_role_change      — AG-level state transitions (SECONDARY→RESOLVING etc.)
+        db_role_change      — per-DB role changes (PRIMARY→RESOLVING etc.)
+        wsfc_cluster        — WSFC/quorum/lease events
+        dtc                 — DTC resource manager init/release/recovery
+        abort_kill          — ABORT_AFTER_WAIT = BLOCKERS session kills
+        nonqual_rollback    — Error 35299 Nonqualified rollback loops
+        remote_harden       — Remote harden failed events
+        starting_up         — Database startup events
+        resync_revert       — Connection established/terminated, resync, reverting
+        adr_version         — ADR VersionCleaner events (Error 22006)
+        errors              — Other AG-related errors and informational messages
+        other_ag            — Remaining AG-matched events
+    - Merges events from both hosts, sorted by timestamp
+
+  ag_errorlog_events.json contains:
+    - target_date
+    - total_events
+    - category_counts     — event count per category
+    - categories          — full event arrays per category
+    - all_events_sorted   — merged timeline
+
+  ag_timeline.txt contains:
+    - One line per event: [host] timestamp spid message
+    - Sorted chronologically across both hosts
+
+Step 3 — Build Failover Timeline
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Script:  scripts/ag-failover-analysis/build_failover_timeline.js
+  Usage:   node scripts/ag-failover-analysis/build_failover_timeline.js <case_dir>
+  Sample:  node scripts/ag-failover-analysis/build_failover_timeline.js C:\Temp\2605110030000091
+
+  Prereq:  ag_schema.json and ag_errorlog_events.json must exist (run Step 1 & 2 first)
+  Input:
+    C:\Temp\2605110030000091\ag_schema.json
+    C:\Temp\2605110030000091\ag_errorlog_events.json
+
+  Output:
+    C:\Temp\2605110030000091\failover_incidents.json
+
+  What it does:
+    - Detects failover incidents from AG role change events
+      (clusters AG→RESOLVING events within 120s into one incident)
+    - Classifies SQL Server shutdown as "SHUTDOWN" event (not a failover)
+    - For each incident, gathers all events and builds:
+        - AG-level role transitions (which AG, which direction, which host)
+        - Per-DB status table (direction + result on each host)
+        - DTC init/release events
+        - ABORT_AFTER_WAIT kills (mapped to DB name via database_id)
+        - Nonqualified Rollback summary (DB, count, time range, spid)
+        - Remote harden failed summary
+    - Marks each DB result as: →PRIMARY ✅, →SEC ✅, STUCK ❌, or →SEC (shutdown)
+
+  Sample result (3 failovers + 1 shutdown):
+    FO1   05:18  ext-ag only
+      DB0015 lost connection, DB0011 became ext-ag PRIMARY
+      DB0031 ext-ag SECONDARY→RESOLVING→SECONDARY (8 DBs ✅)
+      DB0011 ext-ag SECONDARY→RESOLVING→PRIMARY (8 DBs ✅)
+
+    FO2   07:01  intl-ag + ext-ag + batch-ag
+      All 3 AGs failover to DB0031
+      DB0031 intl-ag SECONDARY→RESOLVING→PRIMARY (29 DBs ✅)
+      DB0011 intl-ag PRIMARY→RESOLVING→SECONDARY (29 DBs ✅)
+      DB0011 batch-ag SECONDARY→RESOLVING→SECONDARY (12 DBs ✅)
+      All DBs recovered successfully
+
+    FO3   07:52  intl-ag + batch-ag + ext-ag  ← PROBLEM
+      All 3 AGs failover back to DB0011
+      DB0031 intl-ag PRIMARY→RESOLVING — 25 of 29 DBs STUCK ❌
+        aidcconfig + claims: Nonqualified Rollback ×2225 each
+        4 DBs recovered (aes, db_frs, db_iws_ref, ui)
+      DB0031 batch-ag PRIMARY→RESOLVING→SECONDARY (12 DBs ✅)
+      DB0031 ext-ag SECONDARY→RESOLVING→SECONDARY (8 DBs ✅)
+      DB0011: all DBs recovered successfully
+
+    SHUTDOWN  09:09  HKAZEPWDB0031
+      SQL Server shutdown, all AGs→RESOLVING (not a failover)
+
+  failover_incidents.json contains:
+    - hosts                — old_primary, new_primary
+    - incidents[]          — array of incident objects:
+        id                 — FO1, FO2, FO3, or SHUTDOWN
+        type               — "failover" or "shutdown"
+        start_ts, end_ts   — time window
+        ags_affected       — list of AG names
+        event_counts       — count per sub-category
+        ag_directions      — AG role transitions per host
+        db_status          — per-DB: direction, result, DTC, kills, rollback
+
+Step 4 — Import XEvent into SQL Server
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Script:  scripts/ag-failover-analysis/import_ag_xevent.sql
+  Usage:   sqlcmd -S <sql_server> -E -v case_id="<case_id>" host="<hostname>" xel_path="<path_to_xel>" -i scripts/ag-failover-analysis/import_ag_xevent.sql
+
+  Run once per host, per session type (skip system_health if not available):
+    Required:
+    1. sqlcmd ... host="HKAZEPWDB0031" xel_path="...\AlwaysOn_health*.xel" ...
+    2. sqlcmd ... host="HKAZEPWDB0011" xel_path="...\AlwaysOn_health*.xel" ...
+    3. sqlcmd ... host="HKAZEPWDB0031" xel_path="...\*SQLDIAG*.xel" ...
+    4. sqlcmd ... host="HKAZEPWDB0011" xel_path="...\*SQLDIAG*.xel" ...
+
+    Optional (skip if files not present):
+    5. sqlcmd ... host="HKAZEPWDB0031" xel_path="...\system_health*.xel" ...
+    6. sqlcmd ... host="HKAZEPWDB0011" xel_path="...\system_health*.xel" ...
+
+  Output:
+    SQL database: ag_2605110030000091
+
+  XEL sessions handled:
+    AlwaysOn_health  → hadr_trace, hadr_sync_state, hadr_replica_state, hadr_manager_state, hadr_ddl  (REQUIRED)
+    SQLDIAG          → diagnostics (component_health_result), sqldiag_info, sqldiag_ag_state           (REQUIRED)
+    system_health    → diagnostics (sp_server_diagnostics), errors (error_reported)                     (OPTIONAL)
+
+  Note: SQLDIAG info_message and availability_group_state_change need manual shredding
+  after import (see import script comments). The import script auto-shreds the main
+  AlwaysOn_health events and sp_server_diagnostics/error_reported from system_health.
+
+  Database schema (ag_{case_id}.xe.*):
+    xe.raw_events         — all raw XEvent data (host, session, event_name, event_time, event_data XML)
+    xe.hadr_trace         — hadr_trace_message (Reverting begin/finished, internal AG messages)
+    xe.hadr_sync_state    — hadr_db_partner_set_sync_state (DB sync state + commit_policy)
+    xe.hadr_replica_state — availability_replica_state_change (AG-level role transitions)
+    xe.hadr_manager_state — availability_replica_manager_state_change (ONLINE/OFFLINE/PENDING)
+    xe.hadr_ddl           — alwayson_ddl_executed (DDL operations)
+    xe.diagnostics        — sp_server_diagnostics / component_health_result (component + state)
+    xe.errors             — error_reported from system_health
+    xe.sqldiag_info       — SQLDIAG info_message (Lease Thread, health state changes)
+    xe.sqldiag_ag_state   — SQLDIAG availability_group_state_change (Online/Failed)
+
+  Sample result (DB0031 + DB0011):
+    xe.raw_events:          262,614 (AlwaysOn_health) + 2,983 (SQLDIAG) + 43,230 (system_health)
+    xe.hadr_trace:          257,280 (Reverting, internal AG messages)
+    xe.hadr_sync_state:       1,286
+    xe.hadr_replica_state:       64
+    xe.hadr_manager_state:       11
+    xe.diagnostics:           3,413 (2925 SQLDIAG + 488 system_health)
+    xe.errors:                  426
+    xe.sqldiag_info:             55
+    xe.sqldiag_ag_state:          3
+
+  Important: XEvent timestamps are UTC. ERRORLOG timestamps are server local time.
+  UTC offset for this case: +8 hours (ERRORLOG 07:53 = XEvent 23:53 previous day)
+
+Step 5 — Merge ERRORLOG + XEvent into Unified Timeline
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Script:  scripts/ag-failover-analysis/merge_timeline.js
+  Usage:   node scripts/ag-failover-analysis/merge_timeline.js <case_dir> <sql_server> <utc_offset>
+  Sample:  node scripts/ag-failover-analysis/merge_timeline.js C:\Temp\2605110030000091 localhost 8
+
+  Prereq:  ag_schema.json, ag_errorlog_events.json, ag_{case_id} database with XEvent data
+  Input:
+    C:\Temp\2605110030000091\ag_errorlog_events.json
+    ag_2605110030000091 database (via sqlcmd to localhost)
+
+  Output:
+    C:\Temp\2605110030000091\merged_timeline.json
+    C:\Temp\2605110030000091\merged_timeline.txt
+
+  What it does:
+    - Queries XEvent tables from SQL Server, converts UTC → local time
+    - Merges with ERRORLOG events (already in local time)
+    - Sorts all events chronologically
+    - Includes: hadr_replica_state, hadr_manager_state, hadr_sync_state (with db_id→name),
+      hadr_trace (Reverting), hadr_ddl, sqldiag_info, sqldiag_ag_state, diagnostics state transitions
+
+  Sample result (10652 merged events):
+    ERRORLOG  9,901 events
+    XEvent      751 events (AG-related subset)
+    Total    10,652 events
+
+4. SCRIPT INVENTORY
+-------------------
+  scripts/ag-failover-analysis/
+  ├── parse_alwayson_out.js          Step 1: AlwaysOn.OUT → ag_schema.json
+  ├── extract_ag_errorlog.js         Step 2: ERRORLOG → ag_errorlog_events.json
+  ├── build_failover_timeline.js     Step 3: Detect failovers → failover_incidents.json
+  ├── import_ag_xevent.sql           Step 4: XEL → SQL Server database ag_{case_id}
+  ├── merge_timeline.js              Step 5: ERRORLOG + XEvent → merged_timeline.json/txt
+  └── gen_per_fo_report.js           Step 6: Per-FO HTML + MD reports
+
+Step 6 — Generate Per-FO Reports
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Script:  scripts/ag-failover-analysis/gen_per_fo_report.js
+  Usage:   node scripts/ag-failover-analysis/gen_per_fo_report.js <case_dir> <sql_server> <utc_offset>
+  Sample:  node scripts/ag-failover-analysis/gen_per_fo_report.js C:\Temp\2605110030000091 localhost 8
+
+  Prereq:  All Steps 1-5 completed (ag_schema.json, failover_incidents.json, merged_timeline.json,
+           ag_{case_id} database with XEvent data, original ERRORLOG files)
+
+  Output (per FO):
+    reports/{case_id}_fo1_analysis.html   — HTML report (Catppuccin Mocha theme)
+    reports/{case_id}_fo1_analysis.md     — Markdown report
+    reports/{case_id}_fo2_analysis.html
+    reports/{case_id}_fo2_analysis.md
+    reports/{case_id}_fo3_analysis.html
+    reports/{case_id}_fo3_analysis.md
+
+  Report sections:
+    1. Failover Direction         — per-AG old/new PRIMARY with timestamps
+    2. Key Event Timeline         — per-host table with color-coded badges
+                                    (FAILOVER, ERROR, KILL, RECOVERED, CONNECTED, etc.)
+    3. Trigger Analysis           — raw ERRORLOG evidence (deduped, per-host)
+                                    + Remote harden first/last per DB
+    4. WSFC Error Chain           — 41005→41034→41144→41143→41161 cascade (if present)
+    5. AG-Level State Changes     — XEvent hadr_replica_state + hadr_manager_state
+    6. Per-DB Status Tables       — per-host tables with columns:
+                                    Direction, →RESOLV, DTC Init/Release, →SEC/→PRI,
+                                    Starting up, Resync, Revert Begin/End,
+                                    ABORT Kill, NQ Rollback, Conn Established, Result
+                                    + "N DBs no role change" summary for unchanged AGs
+    7. XEvent Reverting Detail    — hadr_trace begin/finished with log bytes
+    8. Remote Harden & NQ         — first/last per host with raw ERRORLOG
+    9. Analysis & Conclusion      — Trigger cause (Lease termination / Error 1722 / WSFC offline)
+                                    IO context (ASYNC_IO_COMPLETION waits)
+                                    Health state summary
+                                    Per-AG outcome with timestamps
+                                    Per-host recovery (Cat A/B/C classification)
+                                    Key observations (Reverting, Remote harden, cross-AG)
+                                    Stuck DB comparison (if totalStuck > 0):
+                                      Pipeline diagram + side-by-side table for Cat A/B/C reps
+
+  Key features:
+    - Reads raw ERRORLOG from original files (not filtered extracts)
+    - Trigger window: FO start -1 min to +2 min (covers delayed host)
+    - Deduplicates repeated trigger lines (first + "×N more" + last)
+    - Filters SQLDIAG warning↔clean noise (only shows error transitions)
+    - Host role labels per AG (e.g. "intl-ag: demoted | batch-ag: promoted")
+    - NQ rollback shown only on demoted host (host-tagged from build_failover_timeline)
+    - Unique DB count for Starting up / Resync (not raw line count)
+    - Connection established per replica with DB count and time range
