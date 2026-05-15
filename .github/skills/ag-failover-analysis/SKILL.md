@@ -1,0 +1,801 @@
+---
+name: ag-failover-analysis
+description: >-
+  Analyze AG failover events by cross-referencing AlwaysOn.OUT, ERRORLOG, and
+  AlwaysOn_health XEvent data. Classifies each database into one of three
+  categories based on where it got stuck in the DatabaseSwitchRoles pipeline.
+  Use when databases are stuck in RESOLVING after AG failover, or when the user
+  says "analyze AG failover", "AG databases stuck", "分析 AG failover".
+context: fork
+---
+
+# AG Failover Analysis
+
+## Overview
+
+After an AG failover, each database independently executes `DatabaseSwitchRoles` to
+transition roles (e.g. PRIMARY → RESOLVING → SECONDARY). The AG layer dispatches all
+databases in parallel via a thread pool — one database getting stuck does NOT block others.
+
+This skill cross-references three data sources to:
+1. Build a per-database comparison table showing transition progress
+2. **Classify each stuck database** into a diagnostic category (see §5)
+3. **Map ERRORLOG evidence to source code steps** to pinpoint where each DB is blocked
+
+## Source Code Reference — `DatabaseSwitchRoles` Pipeline
+
+Understanding this pipeline is essential. Every ERRORLOG message maps to a specific step:
+
+```
+DatabaseSwitchRoles(HADR_ROLE_RESOLVING)     [HadrDbMgrApi.cpp]
+│
+├─ Step 1-5:   Internal locks, state checks
+├─ Step 6:     ★ ERRORLOG "is changing roles from PRIMARY to RESOLVING"
+│              (printed BEFORE any real work — NOT a progress indicator)
+├─ Step 7-10:  Hekaton prep, set sub-manager target states
+│
+├─ Step 11:    m_userMgr.Stop(Immediate)     ← CAN BLOCK
+├─ Step 12:    m_scanMgr.Stop(Immediate)     ← CAN BLOCK
+├─ Step 13:    m_redoMgr.Stop(Clean)         ← CAN BLOCK
+├─ Step 14-15: m_fullTextMgr / m_filestreamMgr Stop
+│
+├─ Step 16-19: Signal undo, reset quorum, close XEvent/Broker
+├─ Step 20:    StopDtcForDb() — release DTC resource manager
+│              (ERRORLOG: "MS DTC resource manager [db] has been released")
+│
+├─ Step 21:    ★★★ AcquireXDbLockWithKill(INFINITE) ★★★
+│              [HadrDbMgrControl.cpp]
+│              do {
+│                lck_KillSpecificOwners()     → kill all sessions
+│                CleanupDTCXact()             → clean DTC transactions
+│                Acquire(LCK_M_X)            → try exclusive DB lock
+│                if TIMEDOUT → print Error 35299 "Nonqualified...100%"
+│              } while (true)                ← INFINITE timeout = never exits
+│
+├─ Step 22-23: Release DTC states, deregister transport
+├─ Step 24:    SetRole(HADR_ROLE_RESOLVING)  ← role actually changes here
+└─ Step 25:    CleanupPartners()
+```
+
+After Step 24 completes → RESOLVING→SECONDARY → Starting up → Reverting → Resync.
+
+### Why Error 35299 Reports "100%" But Never Completes
+
+`lck_GetRollBackProgress()` [lckmgr.cpp] only checks tasks marked `FKill()`.
+System threads (Ghost cleanup, QDS, Checkpoint) are **never marked FKill** →
+they are skipped → progress starts at 100% and stays at 100%.
+But these system threads still hold shared DB locks → `Acquire(LCK_M_X)` times out → infinite loop.
+
+## Required Inputs
+
+| Input | Type | Required | Description |
+|-------|------|----------|-------------|
+| `case_dir` | string | **Yes** | Directory containing collected logs (see Phase 0) |
+| `investigation_time` | string | No | Specific time to focus on (server local time, `YYYY-MM-DD HH:MM`) |
+| `case_id` | string | No | Case identifier for output naming. Default: directory name |
+
+## Workflow
+
+### Phase 0: Log Collection Checklist
+
+Before analysis can begin, collect the following information and logs.
+
+#### Step 0: Ask the User for Environment Info
+
+Prompt the user for:
+
+| Item | Example | Why |
+|------|---------|-----|
+| **Old primary hostname** | `HKAZEPWDB0031` | The node that was PRIMARY before failover (now stuck in RESOLVING) |
+| **New primary hostname** | `HKAZEPWDB0011` | The node that took over as PRIMARY |
+| **Log file path(s)** | `D:\Cases\2605110030000091\` | Local path where logs are stored or will be downloaded |
+| **Incident time** | `2026-05-11 07:53` (server local) | Approximate time of the failover event |
+
+These are needed to correctly identify which ERRORLOG belongs to which replica
+and to set the investigation time window.
+
+#### Must Have (Minimum) — From Old Primary
+
+| # | Data | Source | How to Collect |
+|---|------|--------|----------------|
+| 1 | **ERRORLOG** (current + .1) | SQL Server | Copy from ERRORLOG path (`SELECT SERVERPROPERTY('ErrorLogFileName')`) |
+| 2 | **AlwaysOn.OUT** | SQLDIAG / Pssdiag | Usually in SQLDIAG output; contains AG/DB/replica mapping |
+| 3 | **AlwaysOn_health XEL** | SQL Server | Default session; copy from `LOG\` folder next to ERRORLOG |
+
+#### Strongly Recommended
+
+| # | Data | Source | Why |
+|---|------|--------|-----|
+| 4 | **New primary ERRORLOG** | Partner replica | Compare DTC RM GUIDs, confirm new primary recovered successfully → proves issue is isolated to old primary |
+| 5 | **system_health XEL** | SQL Server | `wait_info`, `scheduler_monitor`, `sp_server_diagnostics` during stuck period |
+| 6 | **Windows Cluster log** | `Get-ClusterLog` | WSFC heartbeat/communication failure details (Error 1722 etc.) |
+
+#### If Issue Is Still Active (Not Yet Restarted)
+
+| # | Data | Source | Why |
+|---|------|--------|-----|
+| 7 | **Memory dump** | `DBCC STACKDUMP WITH NO_CHANGE_TRACKING;` | **Critical** — thread call stacks reveal exact deadlock chain. This is the ONLY way to confirm root cause. Collect BEFORE restart (adds zero extra downtime since restart is already required). |
+| 8 | **DMV snapshot** | T-SQL | `sys.dm_exec_requests`, `sys.dm_tran_locks`, `sys.dm_os_waiting_tasks` for stuck SPIDs |
+
+#### File Naming Conventions
+
+| Pattern | Description |
+|---------|-------------|
+| `*_AlwaysOn.OUT` | AlwaysOn diagnostic output |
+| `ERRORLOG`, `ERRORLOG.1`, ... | SQL Server error logs |
+| `*AlwaysOn_health*.xel` | AlwaysOn health session XEvent files |
+| `system_health*.xel` | System health session XEvent files |
+
+If logs arrive as `.zip`, extract to `case_dir` before starting Phase 1.
+
+### Phase 1: Parse AlwaysOn.OUT — Build AG → DB Mapping
+
+1. Locate `*_MSSQLSERVER_1033_AlwaysOn.OUT` files in both replica subdirectories:
+   - `{case_dir}/{old_primary_host}/` (e.g. `HKAZEPWDB0031/`)
+   - `{case_dir}/{new_primary_host}/` (e.g. `HKAZEPWDB0011/`)
+
+   Use the old primary's AlwaysOn.OUT as the primary source (it has the pre-failover
+   database_id mapping). The new primary's can be used for cross-validation.
+
+2. Handle encoding — file may be UTF-16LE with BOM or UTF-8.
+
+3. The file contains several sections delimited by `===` header lines. The key sections
+   are formatted as SQL Server fixed-width DMV output (column headers + `---` separator + data rows).
+
+#### Section 1: AG State — `AlwaysOn Availability Group State, Identification and Configuration`
+
+Parse the fixed-width table to extract:
+
+| Column | Description |
+|--------|-------------|
+| `availability_group` | AG name (e.g. `sybasehk-prod-intl-ag`) |
+| `group_id` | AG group GUID |
+| `primary_replica` | Current primary replica name (post-failover snapshot) |
+
+#### Section 2: Replica State — `AlwaysOn Availability Replica State, Identification and Configuration`
+
+Parse to identify replicas and their roles:
+
+| Column | Description |
+|--------|-------------|
+| `group_name` | AG name |
+| `replica_server_name` | Replica hostname |
+| `is_local` | 1 = this node |
+| `role_desc` | Current role (PRIMARY / SECONDARY / RESOLVING) |
+| `availability_mode_Desc` | SYNCHRONOUS_COMMIT / ASYNCHRONOUS_COMMIT |
+| `failover_mode_desc` | AUTOMATIC / MANUAL |
+| `replica_id` | Replica GUID |
+| `group_id` | AG group GUID |
+
+#### Section 3: Database State — `AlwaysOn Availability Database Identification, Configuration, State and Performance`
+
+Parse to build the AG → DB mapping:
+
+| Column | Description |
+|--------|-------------|
+| `database_name` | Database name |
+| `database_id` | Database ID (needed to match ABORT_AFTER_WAIT messages) |
+| `group_id` | AG group GUID (join key to AG State) |
+| `replica_id` | Replica GUID |
+| `is_local` | 1 = this replica |
+| `synchronization_state_desc` | SYNCHRONIZED / NOT SYNCHRONIZING / etc. |
+| `database_state_desc` | ONLINE / RECOVERY_PENDING / etc. |
+
+#### Parsing Fixed-Width Format
+
+The AlwaysOn.OUT uses SQL Server's fixed-width output format:
+```
+column_1                       column_2    column_3
+------------------------------ ----------- ------------------------------------
+value_1                                  5 B148AAAF-0CDB-4802-B716-CF85B09BF8A0
+```
+
+**Parsing approach:**
+1. Find the `---` separator line below the header
+2. Use the dash groups to determine column boundaries (start/end positions)
+3. Split each data row at those positions and trim whitespace
+4. Stop at the next blank line or `===` section header
+
+#### Output: `agDbMap`
+
+Join AG State (`group_id` → `availability_group`) with Database State
+(`group_id` + `is_local = 1`) to produce:
+
+```json
+{
+  "sybasehk-prod-intl-ag": [
+    { "name": "aes", "id": 5 },
+    { "name": "aidcconfig", "id": 10 },
+    ...
+  ],
+  "sybasehk-prod-batch-ag": [...],
+  "sybasehk-prod-ext-ag": [...]
+}
+```
+
+Also record the AG-level metadata:
+- `primary_replica` — who is currently PRIMARY (per AlwaysOn.OUT snapshot)
+- `availability_mode` — SYNC or ASYNC per replica
+- `failover_mode` — AUTOMATIC or MANUAL
+
+### Phase 2: Extract ERRORLOG AG Events
+
+Script: `scripts/ag-failover-analysis/extract_ag_errorlog.js`
+
+```
+node scripts/ag-failover-analysis/extract_ag_errorlog.js <case_dir> <target_date>
+```
+
+Prereq: ag_schema.json (Phase 1). Auto-discovers ERRORLOG files from ag_schema.json.
+Output: `ag_errorlog_events.json`, `ag_timeline.txt`
+
+This script extracts all AG-related events from both hosts' ERRORLOGs on the target date,
+categorizes them, and also detects DTC_SUPPORT from per-DB DTC RM init events
+(updates ag_schema.json with DTC info).
+
+#### Categories extracted:
+
+| Category | ERRORLOG Pattern |
+|----------|-----------------|
+| ag_role_change | `availability replica ... has changed from` |
+| db_role_change | `database "X" is changing roles from` |
+| wsfc_cluster | WSFC errors (41005, 41034, 41143, 41144, 41161, CRC, Error 1722) |
+| dtc | DTC RM init/release/recovery |
+| abort_kill | `ABORT_AFTER_WAIT = BLOCKERS` |
+| nonqual_rollback | `Nonqualified transactions are being rolled back` |
+| remote_harden | `Remote harden of transaction ... failed` |
+| starting_up | `Starting up database` |
+| recovery_completed | `Recovery completed for database` |
+| recovery_progress | `Recovery of database ... is N% complete` |
+| resync | `restarted to resynchronize` |
+| conn_established | `connection with ... database established` |
+| conn_terminated | `connection with ... database terminated` |
+
+### Phase 2b: Detect Failover Incidents
+
+Script: `scripts/ag-failover-analysis/build_failover_timeline.js`
+
+```
+node scripts/ag-failover-analysis/build_failover_timeline.js <case_dir>
+```
+
+Prereq: ag_schema.json, ag_errorlog_events.json (Phase 1 & 2).
+Output: `failover_incidents.json`
+
+This script:
+- Detects failover incidents from AG role change events
+- Clusters AG→RESOLVING events within 120 seconds into one incident
+- Classifies SQL Server shutdown (within 10s of "terminating" message) as SHUTDOWN event
+- For each incident: gathers events, builds per-DB status, identifies NQ rollback, kills, DTC
+
+### Phase 2c: Merge ERRORLOG + XEvent Timeline
+
+Script: `scripts/ag-failover-analysis/merge_timeline.js`
+
+```
+node scripts/ag-failover-analysis/merge_timeline.js <case_dir> <sql_server> <utc_offset>
+```
+
+Prereq: ag_schema.json, ag_errorlog_events.json, ag_{case_id} database (Phase 1, 2, 3).
+Output: `merged_timeline.json`, `merged_timeline.txt`
+
+This script:
+- Queries XEvent tables from SQL Server, converts UTC → local time
+- Merges with ERRORLOG events (already in local time)
+- Includes: hadr_replica_state, hadr_manager_state, hadr_sync_state (with db_id→name),
+  hadr_trace (Reverting), hadr_ddl, sqldiag_info, sqldiag_ag_state, diagnostics transitions
+
+### Phase 3: Import XEvent into SQL Server
+
+Script: `scripts/ag-failover-analysis/import_ag_xevent.sql`
+
+```
+sqlcmd -S localhost -E -v case_id="{case_id}" host="{hostname}" xel_path="{case_dir}/{host}/AlwaysOn_health*.xel" -i scripts/ag-failover-analysis/import_ag_xevent.sql
+```
+
+Run once per host. This creates database `ag_{case_id}` with shredded tables:
+
+| Table | XEvent Source | Key Columns | What It Tells Us |
+|-------|-------------|-------------|-----------------|
+| `xe.hadr_trace` | `hadr_trace_message` | `hadr_message` | Reverting begin/finished, internal AG messages |
+| `xe.hadr_sync_state` | `hadr_db_partner_set_sync_state` | `database_id, sync_state, commit_policy` | DB sync state changes during failover |
+| `xe.hadr_replica_state` | `availability_replica_state_change` | `ag_name, previous_state, current_state` | AG-level role transitions (cross-validates ERRORLOG) |
+| `xe.hadr_manager_state` | `availability_replica_manager_state_change` | `current_state` | AG manager ONLINE/OFFLINE/PENDING_WSFC |
+| `xe.hadr_ddl` | `alwayson_ddl_executed` | `ddl_action, statement` | AG DDL operations |
+
+**Important:** XEvent timestamps are **UTC**. ERRORLOG timestamps are **server local time**.
+Apply UTC offset when correlating (e.g. UTC+8: ERRORLOG 07:53 = XEvent 23:53 previous day).
+
+### Phase 4: XEvent Analysis Checklist
+
+For each failover incident, query these XEvent tables and check the following:
+
+#### Check 1: `xe.hadr_replica_state` — AG-Level Transitions
+
+Query:
+```sql
+SELECT host, event_time, ag_name, previous_state, current_state
+FROM xe.hadr_replica_state
+WHERE event_time BETWEEN @start_utc AND @end_utc
+ORDER BY event_time
+```
+
+**What to verify:**
+- Should match ERRORLOG AG role changes exactly (same AG, same direction, same timestamp)
+- Look for the full lifecycle: `SECONDARY_NORMAL → RESOLVING_NORMAL → PRIMARY_PENDING → PRIMARY_NORMAL` (new primary) and `PRIMARY_NORMAL → RESOLVING_NORMAL → SECONDARY_NORMAL` (old primary)
+- If `RESOLVING_NORMAL → SECONDARY_NORMAL` happens quickly (< 1 min), AG-level recovery succeeded
+- If `RESOLVING_NORMAL → SECONDARY_NORMAL` but individual DBs are stuck → problem is at DB-level, not AG-level
+
+#### Check 2: `xe.hadr_manager_state` — AG Manager Lifecycle
+
+Query:
+```sql
+SELECT host, event_time, current_state
+FROM xe.hadr_manager_state
+WHERE event_time BETWEEN @start_utc AND @end_utc
+ORDER BY event_time
+```
+
+**What to verify:**
+- Normal failover cycle: `OFFLINE → PENDING_WSFC_COMMUNICATION → ONLINE`
+- If stays `OFFLINE` → WSFC communication not restored
+- `OFFLINE → PENDING → ONLINE` with recovery = normal restart sequence
+- `OFFLINE → OFFLINE` at the end = SQL Server shutdown
+
+#### Check 3: `xe.hadr_trace` — Reverting Events (Critical)
+
+Query:
+```sql
+SELECT host, event_time,
+  SUBSTRING(hadr_message, CHARINDEX('[', hadr_message)+1,
+    CHARINDEX(']', hadr_message)-CHARINDEX('[', hadr_message)-1) AS db_name,
+  CASE WHEN hadr_message LIKE '%begin%' THEN 'begin' ELSE 'finished' END AS phase
+FROM xe.hadr_trace
+WHERE event_time BETWEEN @start_utc AND @end_utc
+  AND hadr_message LIKE '%Reverting%'
+ORDER BY event_time
+```
+
+**What to verify:**
+- Each recovered DB should have both `Reverting begin` and `Reverting finished` events
+- `Total logs to revert [N]` indicates undo work volume — larger N = longer reverting
+- **Stuck DBs will have ZERO Reverting events** — they never completed the `DatabaseSwitchRoles` pipeline
+- Compare the list of DBs with Reverting vs the total DB list → missing DBs = stuck
+
+**Diagnostic value:**
+- Reverting present → DB completed `AcquireXDbLockWithKill` (Step 21) and entered undo phase
+- Reverting absent → DB stuck before Step 21 (sub-manager Stop or AcquireXDbLock loop)
+- Only `Reverting begin` without `Reverting finished` → undo phase itself is stuck (rare)
+
+#### Check 4: `xe.hadr_sync_state` — Per-DB Sync State Changes (Critical)
+
+Query:
+```sql
+SELECT host, event_time, database_id, sync_state, commit_policy
+FROM xe.hadr_sync_state
+WHERE event_time BETWEEN @start_utc AND @end_utc
+ORDER BY event_time
+```
+
+**What to verify on the old primary (demoted node):**
+- Look for `sync_state=NOT, commit_policy=KillAll` events
+- On the demoted node, only DBs that reached `AcquireXDbLockWithKill` will fire this event
+- Very few events from the old primary during a stuck failover → most DBs never got that far
+
+**What to verify on the new primary:**
+- Normal pattern: `LOG/WaitForHarden` → `NOT/WaitForHarden` → `LOG/WaitForHarden` as each DB transitions
+- All DBs should eventually show `LOG/WaitForHarden` (synchronized with new secondary)
+- The sequence of DBs appearing here shows the order each DB completed its role transition on the new primary
+
+**Cross-host comparison:**
+- If new primary shows all DBs recovered (`LOG/WaitForHarden`) while old primary shows almost no `hadr_sync_state` events → problem is isolated to old primary's internal state
+
+#### Check 5: `xe.hadr_trace` — Non-Reverting Messages
+
+Query:
+```sql
+SELECT TOP 50 event_time, LEFT(hadr_message, 200) AS msg
+FROM xe.hadr_trace
+WHERE host = @old_primary_host
+  AND event_time BETWEEN @start_utc AND @end_utc
+  AND hadr_message NOT LIKE '%Reverting%'
+ORDER BY event_time
+```
+
+**What to look for:**
+- `Cleaning up conversations for [GUID]` — AG cleanup during failover (normal)
+- `CHadrArProxy::Offline` — AG going offline (normal during failover)
+- Any error-level messages or unexpected patterns
+- Messages mentioning specific database names may indicate where processing stalled
+
+### Phase 5: Classify Each Database
+
+Combine ERRORLOG (Phase 2) and XEvent (Phase 4) evidence to classify each database.
+
+#### Evidence Matrix
+
+For each DB on the **demoted node** (old primary, PRIMARY→RESOLVING), collect:
+
+| Evidence Source | Field | Recovered DB | Stuck DB (Category B) | Stuck DB (Category C) |
+|----------------|-------|-------------|----------------------|----------------------|
+| ERRORLOG | Nonqualified Rollback | 0 or 1 occurrence | Thousands (loop) | 0 (absent) |
+| ERRORLOG | ABORT Kill | 0 or few | May have late kills | 0 (absent) |
+| ERRORLOG | Release DTC | Present (if DTC AG) | Absent | Absent |
+| ERRORLOG | Starting up | Present | Absent | Absent |
+| ERRORLOG | Resync | Present | Absent | Absent |
+| ERRORLOG | RESOLVING→SECONDARY | Within minutes | Only at shutdown | Only at shutdown |
+| ERRORLOG | Remote harden failed | Stops quickly | Continues throughout | Continues throughout |
+| XEvent | Reverting begin/finished | **Both present** | **Absent** | **Absent** |
+| XEvent | `hadr_sync_state` (old primary) | — | **May have** NOT/KillAll | **Absent** |
+| XEvent | `hadr_sync_state` (new primary) | LOG/WaitForHarden | LOG/WaitForHarden | LOG/WaitForHarden |
+
+#### Category A: Recovered ✅
+
+All ERRORLOG + XEvent steps present. Full pipeline completed.
+
+#### Category B: Stuck at `AcquireXDbLockWithKill` ❌
+
+Key distinguisher: **Nonqualified Rollback loop** in ERRORLOG (Error 35299, repeating every ~2s, always "100%").
+XEvent: may have `hadr_sync_state` event with `NOT/KillAll` on the old primary.
+No Reverting events.
+
+#### Category C: Stuck at Sub-manager Stop (Silent) ❌
+
+Key distinguisher: **No Nonqualified Rollback, no ABORT Kill** — completely silent.
+XEvent: no `hadr_sync_state` event on old primary, no Reverting events.
+Only evidence is continued `Remote harden failed` messages.
+
+**Category B vs C:** The key differentiator is whether Nonqualified Rollback messages appear in ERRORLOG. If yes → B. If no → C.
+
+### Phase 6: Per-Failover Analysis Report
+
+For each failover incident, write an analysis section following this structure.
+
+**ANALYSIS WORKFLOW:**
+
+Step A: Use `failover_incidents.json` to get each FO's time range and affected AGs.
+
+Step B: Use per-FO timeline files (`fo1_timeline.txt` etc.) as an **index/summary**.
+        These files provide:
+        - Per-host structure (which host played which role)
+        - Event category counts and summaries
+        - system_health errors and waits (queried from SQL)
+        - Collapsed NQ rollback / remote harden counts
+        - Per-DB status comparison table
+
+        **Limitations of timeline files:**
+        - They are FILTERED extracts — only AG-related messages were extracted
+        - Some messages may have been miscategorized or missed by the extraction regex
+        - Nonqualified Rollback and Remote Harden Failed are collapsed (only count shown)
+        - They do NOT contain the full ERRORLOG text
+        - Use them to identify time ranges and patterns, NOT as the sole data source
+
+Step C: **Go back to the ORIGINAL ERRORLOG files** and read the COMPLETE raw text
+        for each FO's time range (FO start - 5 minutes to FO end) on BOTH hosts.
+        The timeline files are filtered/categorized extracts — they may have missed
+        messages. The ERRORLOG is the ground truth.
+
+        **IMPORTANT — Trigger window timing:**
+        The FO start time in `failover_incidents.json` is the timestamp of the FIRST
+        host to react. The OTHER host may log its WSFC/trigger events 30-90 seconds
+        later. For example:
+        - FO2 start=07:01:40 (HKAZEPWDB0031 goes RESOLVING) but HKAZEPWDB0011's
+          WSFC errors (41144, 41005, 1722) appear at 07:02:43 — 63 seconds later.
+        - FO3 start=07:52:52 (HKAZEPWDB0011 goes RESOLVING) but HKAZEPWDB0031's
+          connection timeouts start at 07:53:29 and lease termination at 07:53:53.
+        Therefore, use at least **FO start - 1 min to FO start + 2 min** for trigger
+        evidence collection from BOTH hosts.
+
+        Read: `{case_dir}/{host}/{host}_MSSQLSERVER_1033_ERRORLOG*`
+
+Step D: **Query the XEvent SQL database** (`ag_{case_id}`) for the same time range
+        (convert to UTC) to get hadr_trace, hadr_sync_state, errors, waits.
+
+Step E: Write analysis based on the complete original data from Steps C and D,
+        citing verbatim messages from the original ERRORLOG and XEvent.
+
+**MANDATORY ANALYSIS RULES:**
+
+1. **The ERRORLOG is the primary source.** The timeline files are indexes — always
+   verify against the original ERRORLOG when writing the report. Read the actual
+   ERRORLOG file for the FO time range to catch anything the extraction scripts missed.
+
+2. **Every conclusion MUST be accompanied by the original log evidence.**
+   - Do NOT write any conclusion without pasting the raw ERRORLOG/XEvent message that supports it.
+   - Do NOT summarize or paraphrase log messages. Copy them verbatim.
+   - If you cannot find log evidence for a claim, state "No evidence found" instead of guessing.
+
+3. **Do NOT omit unfamiliar messages.** If you see a log message you don't recognize,
+   include it in the evidence and note "Unknown — needs further investigation."
+
+4. **Analyze BOTH hosts.** Each FO has two sides. Read ERRORLOG from both hosts
+   for the FO time range.
+
+Format for each observation:
+```
+Evidence:
+  [raw log line copied verbatim from the timeline file]
+  [raw log line copied verbatim from the timeline file]
+
+Conclusion: [your interpretation of the evidence above]
+```
+
+#### FO Header
+
+Each failover section MUST state clearly in the header:
+- **Which AG(s)** failovered
+- **From which host to which host** (old PRIMARY → new PRIMARY)
+- Per-AG direction if multiple AGs behave differently
+
+Example:
+```
+FO2 — 07:01:40
+  intl-ag: PRIMARY moved from HKAZEPWDB0011 → HKAZEPWDB0031
+  batch-ag: stayed on HKAZEPWDB0031 (no role change)
+  ext-ag: PRIMARY stayed on HKAZEPWDB0011 (HKAZEPWDB0031 was secondary, went RESOLVING→SECONDARY)
+```
+
+Derive the direction from:
+- `connection with primary database terminated ... on the availability replica 'X'` → X was the old PRIMARY
+- AG role change messages: `PRIMARY_NORMAL → RESOLVING_NORMAL` = this host lost PRIMARY
+- AG role change messages: `RESOLVING_NORMAL → PRIMARY_PENDING → PRIMARY_NORMAL` = this host gained PRIMARY
+
+#### 6.1 Trigger — Raw Evidence
+
+List the original ERRORLOG/XEvent messages that show WHY this failover happened.
+Copy the actual messages verbatim, do NOT summarize them.
+
+**Important messages to include in Trigger Evidence:**
+- `connection with primary database terminated for secondary database 'X' on the availability replica 'Y'`
+  → This reveals who was PRIMARY before the failover (replica Y = the PRIMARY that was lost)
+- `A connection timeout has occurred on a previously established connection to availability replica`
+  → Shows which replicas lost connectivity and when
+- `Lease Thread terminated` / `Health worker was asked to terminate` (SQLDIAG info_message)
+  → Shows WSFC health determination caused the failover
+- `availability_group_state_change target=Failed failure=SYSTEM_UNHEALTHY` (SQLDIAG)
+- AG role change messages (both ERRORLOG and XEvent `hadr_replica_state`)
+- `ASYNC_IO_COMPLETION` / long waits from system_health (if present before FO)
+- Error 41005/41144/41143/41161 (WSFC errors) if present
+
+**CRITICAL — Correctly identifying OLD PRIMARY vs NEW PRIMARY in trigger analysis:**
+
+Connection timeout messages list the TARGET replica, NOT the source. Multiple replicas
+may appear in connection timeout targets, but they have DIFFERENT roles:
+
+- The **OLD PRIMARY** is the node that was PRIMARY before the failover and went down.
+  Identify it from: `connection with primary database terminated ... on replica 'X'`
+  → X was the PRIMARY. Or from `ag_directions` in `failover_incidents.json`.
+- The **NEW PRIMARY** is the node promoted to PRIMARY after the failover.
+  It will show `RESOLVING → PRIMARY_PENDING → PRIMARY_NORMAL` in XEvent/ERRORLOG.
+- **Other replicas** (DR secondaries, read-only replicas) may also appear in connection
+  timeout targets — they are collateral, NOT the cause.
+
+Common mistake: collecting ALL connection timeout targets and listing them as
+"the PRIMARY node becoming unreachable." This is WRONG when multiple replicas
+time out simultaneously. Example:
+
+```
+WRONG: "Root Cause: PRIMARY node (HKAZEPWDB0015, HKAZEPWDB0011) became unreachable"
+  → HKAZEPWDB0015 was the old PRIMARY; HKAZEPWDB0011 was promoted to new PRIMARY.
+     Listing both as "becoming unreachable" is contradictory and confusing.
+
+RIGHT: "Root Cause: ext-ag PRIMARY node HKAZEPWDB0015 became unreachable.
+        Connection timeouts to HKAZEPWDB0015 detected at 05:18:10 on both
+        HKAZEPWDB0031 and HKAZEPWDB0011 (both SECONDARY for ext-ag).
+        HKAZEPWDB0011 was promoted to new PRIMARY at 05:18:31."
+```
+
+To determine the old PRIMARY:
+1. Check `ag_directions` — find the host with `PRIMARY_NORMAL → RESOLVING_NORMAL`
+2. Check `connection with primary database terminated` messages — the replica named is the old PRIMARY
+3. If the old PRIMARY is a 3rd host not in our 2-host analysis set (e.g. HKAZEPWDB0015),
+   it won't have AG direction data — identify it from the connection terminated messages
+
+Example format:
+```
+Evidence (ERRORLOG, HKAZEPWDB0031):
+  05:18:26.74 spid2685s  Always On Availability Groups connection with primary database
+              terminated for secondary database 'db_work_e' on the availability replica
+              'HKAZEPWDB0015' with Replica ID: {8612424b-...}
+  → This tells us HKAZEPWDB0015 was the PRIMARY for ext-ag before this failover.
+
+  07:53:29.28 spid2714s  A connection timeout has occurred on a previously established
+              connection to availability replica 'HKAZEPWDB0011' with id [...]
+  07:53:30.35 spid2685s  A connection timeout has occurred on ... 'HKAZEPWDB0015'
+
+Evidence (SQLDIAG XEvent, HKAZEPWDB0031):
+  07:53:31.33 [hadrag] SQL Server component 'query_processing' health state has been
+              changed from 'clean' to 'warning'
+  07:53:53.77 [hadrag] Lease Thread terminated
+  07:53:53.77 [hadrag] Lease Thread terminated
+  07:53:53.77 [hadrag] Health worker was asked to terminate
+
+Evidence (system_health XEvent, HKAZEPWDB0031):
+  07:53:40   ASYNC_IO_COMPLETION  1813s (30 min)
+  07:53:45   ASYNC_IO_COMPLETION  784s (13 min)
+
+Conclusion: Failover triggered by WSFC lease thread termination on HKAZEPWDB0031.
+Connection timeouts to all secondary replicas started 24 seconds before lease termination.
+System was under IO stress (30-minute ASYNC_IO_COMPLETION waits).
+```
+
+#### 6.2 AG-Level Flow — Raw Evidence
+
+List the AG state change messages from both ERRORLOG and XEvent.
+**MUST include evidence from BOTH hosts.** Each host has its own section in the
+timeline file — read and cite from both.
+
+For each host, show:
+- AG role changes (with timestamps)
+- Connection terminated/established messages
+- SQLDIAG events (if any)
+- Key errors
+
+**Do NOT skip a host even if it "just recovered normally".** The new primary's timeline
+shows when it became PRIMARY, when it started up databases, and when connections were
+re-established. This is essential for understanding the full picture.
+
+#### 6.3 Per-Host Analysis
+
+**MANDATORY: Analyze EVERY host that has events in the timeline file.**
+
+The timeline file has sections like:
+```
+################################################################################
+# HKAZEPWDB0031 (demoted from PRIMARY)
+################################################################################
+...
+
+################################################################################
+# HKAZEPWDB0011 (promoted to PRIMARY)
+################################################################################
+...
+```
+
+You MUST read and cite evidence from EACH host section. For each host:
+1. What role did this host have before the FO?
+2. What happened during the FO? (connection terminated, AG role change, DB role change)
+3. What was the outcome? (all DBs recovered? any stuck?)
+4. Any errors or unusual events?
+
+#### 6.4 Per-DB Status Table
+
+Build a per-node, per-AG table showing EVERY database's transition timeline.
+**Generate one table per node.** Each column = one step in the recovery pipeline.
+Use actual timestamps from the log. Use `-` for "not present in log".
+
+**Required columns:**
+
+| Column | Source | Description |
+|--------|--------|-------------|
+| AG Name | ag_schema.json | Which AG this DB belongs to |
+| DB Name | ag_schema.json | Database name |
+| ID | ag_schema.json | database_id on this node |
+| Init DTC | ERRORLOG | `Initializing MS DTC resource manager [...] for database 'X'` timestamp |
+| Release DTC | ERRORLOG | `MS DTC resource manager [...] has been released` timestamp |
+| PRIMARY→RESOLVING | ERRORLOG | `database "X" is changing roles from "PRIMARY" to "RESOLVING"` timestamp |
+| RESOLVING→SEC | ERRORLOG | `database "X" is changing roles from "RESOLVING" to "SECONDARY"` timestamp |
+| Starting up | ERRORLOG | `Starting up database 'X'` timestamp |
+| Resync | ERRORLOG | `is being restarted to resynchronize` timestamp |
+| Revert Begin | XEvent hadr_trace | `Database [X] - Reverting begin: Total logs to revert [N]` timestamp |
+| Revert End | XEvent hadr_trace | `Database [X] - Reverting finished` timestamp |
+| ABORT Kill | ERRORLOG | `killed by an ABORT_AFTER_WAIT = BLOCKERS DDL statement on database_id = N` — count and first timestamp |
+| NQ Rollback | ERRORLOG | `Nonqualified transactions are being rolled back in database X` — first timestamp, last timestamp, count |
+
+**Example table (Node: HKAZEPWDB0031, FO3):**
+
+| AG | DB | ID | Init DTC | Release DTC | PRI→RESOLV | RESOLV→SEC | Starting up | Resync | Revert Begin | Revert End | ABORT Kill | NQ Rollback |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| intl-ag | aes | 5 | - | - | 07:53:53.85 | 07:54:26.15 | 07:54:29 | 07:55:03 | 07:54:56 | 07:55:00 | ×1 07:53:53 | - |
+| intl-ag | aidcconfig | 10 | - | - | 07:53:53.85 | 09:09:12 | - | - | - | - | ×1 09:00:02 | 07:53:55—09:09:10 ×2225 |
+| intl-ag | db_aadmin | 11 | - | - | 07:53:53.85 | 09:09:12 | - | - | - | - | - | - |
+| batch-ag | db_ebiz | 9 | - | 07:53:54.24 | 07:53:54.23 | 07:54:26.00 | 07:55:15 | 07:55:13 | 07:55:07 | 07:55:10 | - | - |
+
+**Rules:**
+- `-` means "not present in log" — this is evidence of absence, not a guess
+- RESOLV→SEC at shutdown time (e.g. 09:09:12) = DB was stuck until forced shutdown
+- Init DTC only appears on the NEW primary side (DB becoming PRIMARY initializes DTC)
+- Release DTC only appears on the OLD primary side (DB leaving PRIMARY releases DTC)
+- A separate table is needed for each node that has DB events in this FO
+
+#### 6.4 Key Observations
+
+Derived from the evidence above. **Each observation MUST cite the specific log evidence:**
+
+Bad example (DO NOT write like this):
+  "25 intl-ag DBs were stuck in RESOLVING"  ← no evidence cited
+
+Good example:
+  "Evidence: Per-DB table shows 25 intl-ag DBs have `-` for all columns 
+   (Starting up, Recovery, Revert, Resync) after →RESOLVING.
+   Only →SECONDARY timestamp is 09:09:12 (= shutdown time).
+   Conclusion: These 25 DBs never progressed past the initial →RESOLVING step."
+
+#### 6.5 Cross-FO Comparison
+
+For cases with multiple failovers, compare:
+- Why did FO2 succeed (same DBs, same host) but FO3 fail?
+- What was different about the system state?
+
+### Phase 7: Generate HTML Report
+
+Generate an HTML report using the Catppuccin Mocha dark theme.
+The report structure follows Phase 6 — for each FO:
+
+1. **Trigger** — raw ERRORLOG/XEvent evidence, then one-line conclusion
+2. **AG Flow** — raw state change messages from both hosts
+3. **Per-DB Status Table** — full table with actual timestamps
+4. **Key Observations** — derived from evidence, with references
+5. **Cross-FO Comparison** — if multiple FOs
+
+Report-wide sections:
+- **Server & AG Summary** — version, AG config, DTC, replica topology
+- **Failover Overview** — table of all incidents with result
+- **Recommendations** — dump collection, WSFC investigation
+
+Save to: `reports/{case_id}_ag_failover_report.html`
+
+## Dump Collection Guidance
+
+### Why Dump Is Essential
+
+ERRORLOG tells us **where** each DB is stuck (Step 21 vs Step 11-15).
+Only thread call stacks in a dump can tell us **why** — which specific resource
+deadlock prevents progress.
+
+### Arguing for Dump Collection
+
+**The mitigation for stuck RESOLVING is restarting SQL Server.**
+Since a restart is already required, collecting a dump before restart adds zero
+additional downtime — the databases are already inaccessible.
+
+Recommended procedure when issue recurs:
+1. Confirm databases stuck in RESOLVING (service already degraded)
+2. Collect filtered dump (1-3 minutes):
+   ```sql
+   DBCC STACKDUMP WITH NO_CHANGE_TRACKING;
+   ```
+   Or via sqldumper:
+   ```
+   "C:\Program Files\Microsoft SQL Server\150\Shared\SqlDumper.exe" <PID> 0 0x8100 0 "C:\Temp\dumps"
+   ```
+3. Immediately restart SQL Server
+
+### What to Look for in the Dump
+
+1. **Per-DB worker thread call stacks** — confirm stuck at `AcquireXDbLockWithKill` or sub-manager Stop
+2. **DB shared lock holders** — identify which system thread (Ghost/QDS/Checkpoint) blocks exclusive lock
+3. **Sub-manager internal state** — if Category C, which Stop() call is blocked and on what resource
+
+## DTC Analysis
+
+### Check DTC Configuration
+
+Search ERRORLOG for per-database DTC resource manager events:
+
+| Pattern | Meaning |
+|---------|---------|
+| `Initializing MS DTC resource manager [GUID] for database 'X'` | DTC_SUPPORT=PER_DB |
+| `MS DTC resource manager [X] has been released` | DTC_SUPPORT=PER_DB |
+| No per-DB DTC events for an AG | DTC_SUPPORT NOT configured |
+
+**Do NOT assume DTC is involved** just because databases are stuck and no "DTC released"
+message appears. Confirm by checking for per-DB DTC RM init events. If none exist,
+DTC_SUPPORT is not configured and DTC is not the cause.
+
+### Cross-Server DTC Comparison
+
+When both old and new primary ERRORLOGs are available, compare DTC RM GUIDs.
+Same GUIDs on both sides = DTC correctly transferred. New primary completing
+successfully while old primary is stuck = problem isolated to old primary's internal state.
+
+## Notes
+
+- ERRORLOG timestamps are in server local time; XEvent timestamps are in UTC
+- AlwaysOn.OUT is a snapshot at collection time, not incident time
+- `database_id` in ABORT_AFTER_WAIT messages must be mapped via AlwaysOn.OUT
+- Remote harden failed messages continuing = system threads still writing to the DB
+  (proves the DB is not exclusively locked, confirming Step 21 not yet acquired)
+- Error 22006 (ADR VersionCleaner aborted) = confirms exclusive DB lock waiter exists
+- Some databases may have zero ERRORLOG messages (Category C) — most concerning
+- KB3139534 — AG database stuck in RESOLVING due to internal threads

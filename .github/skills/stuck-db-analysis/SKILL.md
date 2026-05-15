@@ -1,0 +1,229 @@
+---
+name: stuck-db-analysis
+description: >-
+  Deep-dive analysis when AG databases are stuck in RESOLVING after failover.
+  Compares recovered vs stuck databases side-by-side, maps ERRORLOG evidence
+  to DatabaseSwitchRoles source code pipeline steps, and classifies each stuck
+  DB into Category B (AcquireXDbLockWithKill loop) or Category C (sub-manager
+  Stop block). Invoked automatically by ag-failover-analysis when stuck DBs
+  are detected, or manually when user says "analyze stuck DB", "compare
+  recovered vs stuck", "deep dive resolving", "源码分析".
+context: fork
+---
+
+# Stuck DB Analysis — DatabaseSwitchRoles Pipeline Deep Dive
+
+## When to Invoke
+
+This skill is triggered when:
+1. The ag-failover-analysis report finds **stuck databases** (Category B or C)
+2. User asks for deep-dive on why specific DBs are stuck
+3. User wants recovered-vs-stuck comparison
+4. User asks to map ERRORLOG to source code
+
+## Prerequisites
+
+- `ag_schema.json` — AG/DB mapping
+- `failover_incidents.json` — per-FO per-DB status with host-tagged data
+- `ag_{case_id}` SQL database — XEvent data (hadr_trace, hadr_sync_state)
+- Original ERRORLOG files accessible
+- Case directory with per-host subdirectories
+
+## Source Code Knowledge Base
+
+The following reference files contain pre-cached source code analysis.
+**Read these instead of re-searching source code each time:**
+
+| File | Content |
+|------|---------|
+| `reference/database_switch_roles_pipeline.md` | Complete `DatabaseSwitchRoles` function (Steps 1-25), `AcquireXDbLockWithKill` loop, `lck_GetRollBackProgress`, `m_userMgr.Stop()`, thread pool dispatch chain, error codes |
+| `reference/lock_dependency.md` | Lock hierarchy, who holds what during stuck scenarios, deadlock chain (confirmed by dump), AG-level vs per-DB locks, wait types |
+
+**Usage**: Before analyzing a stuck DB case, `read_file` both reference files to load the
+pipeline steps and lock dependency knowledge. This avoids re-running source-search agent.
+
+## Analysis Method
+
+### Step 1: Select Representative Databases
+
+For each host that has stuck databases, select **three representative DBs**:
+
+| Category | Selection Criteria | Example |
+|----------|-------------------|---------|
+| **Cat A** (Recovered ✅) | Same AG as stuck DBs, `to_resolving` from PRIMARY, has `starting_up` | aes (DB 5) |
+| **Cat B** (AcquireXDbLock ❌) | Has `nonqual_rollback_{host}` with count > 0 | aidcconfig (DB 10) |
+| **Cat C** (Silent ❌) | No NQ rollback, no ABORT kill after initial wave, no starting_up | db_aadmin (DB 11) |
+
+Pick the **first available** DB from each category. If Cat B is empty, compare only A vs C.
+If Cat C is empty, compare only A vs B.
+
+### Step 2: Build Side-by-Side Comparison Table
+
+For each representative DB, extract from ERRORLOG and XEvent:
+
+| Pipeline Step | Source | Cat A (Recovered) | Cat B (NQ Loop) | Cat C (Silent) |
+|--------------|--------|-------------------|-----------------|----------------|
+| AG connections terminated | ERRORLOG | timestamp | timestamp | timestamp |
+| PRIMARY → RESOLVING (Step 6) | ERRORLOG | timestamp (spidXs) | timestamp (spidXs) | timestamp (spidXs) |
+| Hardened LSN at start | ERRORLOG ("State info") | LSN value | LSN value | LSN value |
+| ABORT_AFTER_WAIT kill | ERRORLOG | PID + ts | late or none | **none** |
+| Remote harden failed | ERRORLOG | ×N → **stops** | ×N → **continues** | ×N → **continues** |
+| Nonqualified rollback | ERRORLOG | **none** | **×thousands** | **none** |
+| hadr_sync_state KillAll | XEvent | — | may have NOT/KillAll | **absent** |
+| RESOLVING → SECONDARY | ERRORLOG | within minutes | only at shutdown | only at shutdown |
+| Starting up | ERRORLOG | timestamp | — | — |
+| Connection with primary | ERRORLOG | timestamp | — | — |
+| Reverting begin | XEvent hadr_trace | timestamp (bytes) | — | — |
+| Reverting finished | XEvent hadr_trace | timestamp | — | — |
+| Resync | ERRORLOG | timestamp | — | — |
+| Background LSN advance | ERRORLOG (remote harden) | **stops** | small (+N) | large (+N) |
+| Background writers | ERRORLOG (remote harden txn names) | — | Ghost, QDS | Ghost, **QDS** (per 15min) |
+
+### Step 3: Extract Background Writer Detail (for Cat B and C)
+
+For each stuck DB, parse the Remote harden failed messages to identify:
+
+```
+Remote harden of transaction '<txn_name>' (ID ...) started at <time>
+  in database '<db_name>' at LSN (<part1>:<part2>:<part3>) failed.
+```
+
+Extract:
+- **Transaction name** → identifies the system thread type:
+  - `GhostCleanupTask` → Ghost cleanup (shared DB lock)
+  - `QDS base transaction` / `QDS batch` / `QDS nested transaction` → Query Data Store
+  - `CtCleanupTblList` / `CtCleanupTblDelete` → Change Tracking cleanup
+  - User transaction names (e.g. `DNA_FAS SC`) → user session (should have been killed)
+- **LSN progression** → how much the stuck DB's log is advancing while stuck
+  - Extract first and last LSN from remote harden messages
+  - Difference = amount of new log generated by system threads
+
+### Step 4: Map to DatabaseSwitchRoles Pipeline
+
+**→ See `reference/database_switch_roles_pipeline.md` for complete source code with line numbers.**
+
+Summary pipeline (PRIMARY → RESOLVING):
+
+```
+DatabaseSwitchRoles(HADR_ROLE_RESOLVING)  [HadrDbMgrApi.cpp L1391-2103]
+│
+├─ L1504  Step 6:  scierrlog "changing roles PRIMARY → RESOLVING" ← before any work
+├─ L1511  Step 7:  scierrlog State info (Hardened/Commit LSN)
+├─ L1524  Step 8:  HkHostDbSwitchToResolving()
+├─ L1563  Step 9:  SetTargetStateForAllMgrs(Stopped)
+├─ L1567  Step 11: m_userMgr.Stop(Immediate)      ← CAN BLOCK (Cat C)
+├─ L1568  Step 12: m_scanMgr.Stop(Immediate)      ← CAN BLOCK (Cat C)
+├─ L1569  Step 13: m_redoMgr.Stop(Clean)           ← CAN BLOCK (Cat C)
+├─ L1611  Step 18: StopDtcForDb() → "DTC RM released"
+├─ L1616  Step 19: ★★★ AcquireXDbLockWithKill(INFINITE) ★★★ ← Cat B stuck here
+├─ L1634  Step 22: SetRole(RESOLVING) ← role actually changes
+└─ L1685  Step 24: CleanupPartners()
+```
+
+**Key lock held during AcquireXDbLockWithKill loop:**
+- `m_DBRLock` (per-DB, RWLOCK_WRITE) — held by thread pool worker for entire function scope
+- → See `reference/lock_dependency.md` for complete lock chain and deadlock patterns
+
+### Step 5: Determine Stuck Position
+
+**Evidence-based classification:**
+
+| Evidence | Cat A | Cat B | Cat C |
+|----------|-------|-------|-------|
+| Step 6 message logged | ✅ | ✅ | ✅ |
+| NQ Rollback (Error 35299) | ❌ | ✅ thousands | ❌ |
+| hadr_sync_state KillAll (XEvent) | — | may have | ❌ |
+| Reverting events (XEvent) | ✅ both | ❌ | ❌ |
+| DTC Release | ✅ (if DTC AG) | ❌ | ❌ |
+| Starting up / Resync | ✅ | ❌ | ❌ |
+| Remote harden continues | stops | continues | continues |
+| Background LSN advances | stops | small | large |
+
+**Deduction logic:**
+
+1. **Has NQ Rollback?** → YES → **Cat B: stuck at Step 21** (`AcquireXDbLockWithKill`)
+   - Confirmed by: Error 35299 loop, always "100%", hadr_sync_state KillAll event
+   - Root cause: system threads hold shared DB lock, never FKill-killable
+
+2. **No NQ Rollback, no Starting up?** → **Cat C: stuck at Steps 11-13** (sub-manager Stop)
+   - Confirmed by: complete silence after Step 6 message, no ABORT kills after initial wave
+   - Root cause: one of `m_userMgr.Stop`/`m_scanMgr.Stop`/`m_redoMgr.Stop` blocked
+   - **Cannot determine which sub-manager without memory dump**
+
+3. **Has Starting up + Reverting + Resync?** → **Cat A: recovered**
+
+### Step 6: Source Code Reference
+
+**→ See `reference/database_switch_roles_pipeline.md` for complete function implementations.**
+**→ See `reference/lock_dependency.md` for lock hierarchy and deadlock patterns.**
+
+Key points (pre-cached, do not re-search):
+
+- **Cat B root cause**: `AcquireXDbLockWithKill(INFINITE)` loop — system threads hold shared
+  DB lock, not FKill-marked → `lck_GetRollBackProgress` reports 100% → infinite loop
+- **Cat C root cause**: Cannot determine from ERRORLOG/code alone. `m_userMgr.Stop()`,
+  `m_scanMgr.Stop()`, `m_redoMgr.Stop()` can each block on internal resources.
+  **Memory dump is the ONLY way** to identify the specific blocking resource.
+- **m_DBRLock held during entire execution**: Thread pool worker holds per-DB `m_DBRLock`
+  (WRITE) for the full `DatabaseSwitchRoles` scope. A subsequent role change `Publish()`
+  for the same DB will block waiting for this lock.
+
+Cat C hints (without dump):
+- Error 22006 (ADR VersionCleaner aborted) → exclusive DB lock waiter exists
+- Remote harden with QDS transaction names → QDS actively writing
+- ASYNC_IO_COMPLETION waits → IO-blocked system thread may prevent Stop completion
+
+### Step 7: Generate Output
+
+Output a markdown section titled "Stuck DB — Comparative Analysis & Source Code Mapping"
+containing:
+
+1. Pipeline diagram (reference `reference/database_switch_roles_pipeline.md`)
+2. Side-by-side comparison table for representative DBs
+3. Per-category interpretation with source code references
+4. Background writer analysis (transaction names, LSN progression)
+5. Recommendations:
+   - **Cat B**: Need dump to identify which system thread holds shared DB lock
+   - **Cat C**: Need dump to identify which sub-manager Stop is blocked
+   - Both: Collect dump BEFORE restart (`DBCC STACKDUMP WITH NO_CHANGE_TRACKING`)
+
+## Integration with gen_per_fo_report.js
+
+The script `scripts/ag-failover-analysis/gen_per_fo_report.js` automatically generates
+this analysis in the MD output when `totalStuck > 0`. The relevant code section:
+
+1. Picks representative DBs (Cat A, B, C) from `dbStatus`
+2. Builds comparison table from `dbStatus` + `revertData` + `killAllDbs` + `rawDbEvents`
+3. Maps to pipeline steps with interpretation
+4. Outputs in both HTML (section 9) and MD (final section)
+
+## Key Rules
+
+- **Never guess the stuck position.** Only classify based on direct evidence.
+- **Cat B vs Cat C is determined by NQ Rollback presence**, not by ABORT kill.
+  Initial ABORT kills happen at Step 6 for ALL DBs. Only NQ Rollback distinguishes B from C.
+- **Remote harden continuing = DB not exclusively locked** — confirms Step 21 not completed.
+- **hadr_db_partner_set_sync_state KillAll is conditional** — NOT all DBs emit it, even recovered ones.
+  The XEvent fires inside `MarkPartnerNotSynchronized()` on the **success path only**:
+  ```
+  EX_HADR_TRYBACKOUT {
+      UpdateReplicaInfoInAg(NOT);   // write to WSFC cluster
+      SetSyncState(NOT);
+      fire XEvent(commit_policy = m_hardenPolicy);  // current value
+      SetHardenPolicy(DoNothing);
+  }
+  EX_CATCHSE {
+      SetHardenPolicy(KillAll);   // exception: set KillAll, NO XEvent
+  }
+  ```
+  If the WSFC cluster is unavailable during the first call, `UpdateReplicaInfoInAg` throws →
+  KillAll is set in catch → no XEvent. When the cluster recovers and the second call succeeds,
+  XEvent fires with the **stale KillAll** value from the first failed call.
+  
+  Recovered DBs that only had ONE successful call → XEvent fires with DoNothing (not KillAll).
+  Cat C DBs that never reached `MarkPartnerNotSynchronized` → no event at all.
+  
+  **Do NOT use KillAll presence/absence alone to determine which step a DB reached.**
+  Use NQ rollback + Remote harden + Reverting as the primary classification evidence.
+- **LSN progression from Remote harden** shows system thread activity level.
+  Larger progression = more active system threads = harder to acquire exclusive lock.
