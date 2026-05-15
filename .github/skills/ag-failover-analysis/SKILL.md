@@ -735,6 +735,45 @@ Report-wide sections:
 
 Save to: `reports/{case_id}_ag_failover_report.html`
 
+### Phase 8: Search TSG Wiki, KB Articles, and Bug Work Items
+
+After reports are generated, invoke the `docs-lookup` agent to search for related
+technical knowledge. This step runs **automatically** when stuck DBs are found or
+when specific errors are identified.
+
+#### What to Search
+
+| Search Target | When | What to Look For |
+|---------------|------|-----------------|
+| **CSS Wiki TSG** | Always | AG stuck RESOLVING TSGs, latch timeout TSGs, WSFC troubleshooting |
+| **Microsoft Learn KB** | Always | Known fixes for errors found (e.g. Error 35299, 41144, 22006) |
+| **Bug Work Items** | When stuck DBs found | Existing bugs for `AcquireXDbLockWithKill`, `DatabaseSwitchRoles` stuck |
+| **CU Fix Lists** | When version is known | Check if customer's CU has relevant fixes |
+
+#### Search Queries (run in parallel via docs-lookup sub-agents)
+
+1. **CSS Wiki**: Search for AG-specific TSGs
+   - `"AG database stuck RESOLVING"` or `"AG failover stuck"`
+   - `"AcquireXDbLockWithKill"` or `"Nonqualified rollback 100%"`
+   - `"Error 41144"` / `"Error 1722"` / `"WSFC lease timeout"`
+   - The specific error codes found in the case
+
+2. **Microsoft Learn**: Search for KB and docs
+   - `"AG database stuck RESOLVING state"`
+   - `"KB3139534"` (known AG RESOLVING issue)
+   - `"availability group failover troubleshooting"`
+   - Error numbers from ERRORLOG (e.g. `"error 35299"`, `"error 22006"`)
+
+3. **Bug/Work Items**: Search ADO for existing bugs
+   - `"DatabaseSwitchRoles stuck"` or `"AcquireXDbLockWithKill infinite"`
+   - `"AG RESOLVING Ghost cleanup"` or `"AG RESOLVING QDS"`
+
+#### Output
+
+Save search results to: `reports/{case_id}_docs/`
+- One markdown file per search source (e.g. `csswiki_AG_stuck_resolving_TSGs.md`)
+- Include in the final report's Recommendations section
+
 ## Dump Collection Guidance
 
 ### Why Dump Is Essential

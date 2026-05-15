@@ -182,13 +182,14 @@ Default connection: `localhost` with Windows auth. No special setup needed.
 - SQL Server: localhost
 ```
 
-The agent runs 6 steps automatically:
+The agent runs 7 steps automatically:
 1. Parse AlwaysOn.OUT → `ag_schema.json`
 2. Extract ERRORLOG → `ag_errorlog_events.json` + `failover_incidents.json`
 3. Import XEvent → SQL database `ag_<case_id>`
 4. Merge ERRORLOG + XEvent → `merged_timeline.json`
 5. Generate per-FO reports → `reports/<case_id>_fo[1-3]_analysis.html/.md`
 6. If stuck DBs found → invoke `stuck-db-analysis` for deep-dive
+7. Search CSS Wiki TSGs, Microsoft Learn KBs, and bug work items → `reports/<case_id>_docs/`
 
 **4. Reports** — generated in `reports/`:
 
