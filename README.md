@@ -11,6 +11,7 @@ sqlcsi/
 ├── agents/                            # Sub-agents (description + lightweight workflow)
 │   ├── errorlog-analysis.agent.md
 │   ├── xevent-analysis.agent.md
+│   ├── ag-failover-analysis.agent.md
 │   ├── docs-lookup.agent.md
 │   ├── dump-analysis.agent.md
 │   └── source-search.agent.md
@@ -18,6 +19,12 @@ sqlcsi/
 ├── skills/                            # Detailed methodologies (forked context per skill)
 │   ├── errorlog-analysis/SKILL.md
 │   ├── xevent-analysis/SKILL.md
+│   ├── ag-failover-analysis/SKILL.md
+│   ├── stuck-db-analysis/
+│   │   ├── SKILL.md
+│   │   └── reference/                 # Pre-cached source code knowledge base
+│   │       ├── database_switch_roles_pipeline.md
+│   │       └── lock_dependency.md
 │   ├── docs-lookup/SKILL.md
 │   └── dump-analysis/SKILL.md
 │   #  (source-search has no separate skill — methodology is inline in its agent file)
@@ -26,7 +33,15 @@ sqlcsi/
 │   ├── parse_errorlog.js
 │   ├── extract_xel.ps1
 │   ├── parse_xevent.js
-│   └── gen_merged_report.js
+│   ├── gen_merged_report.js
+│   └── ag-failover-analysis/          # AG failover multi-step pipeline
+│       ├── parse_alwayson_out.js      # Phase 1: AlwaysOn.OUT → ag_schema.json
+│       ├── extract_ag_errorlog.js     # Phase 2: ERRORLOG → ag_errorlog_events.json
+│       ├── build_failover_timeline.js # Phase 2b: Detect FO incidents
+│       ├── import_ag_xevent.sql       # Phase 3: XEL → SQL Server shredded tables
+│       ├── merge_timeline.js          # Phase 2c: Merge ERRORLOG + XEvent
+│       ├── gen_fo_report.js           # Phase 7: Single combined HTML report
+│       └── gen_per_fo_report.js       # Phase 7: Per-FO HTML + MD reports
 │
 ├── .vscode/
 │   └── mcp.json                       # MCP server registrations
@@ -47,6 +62,8 @@ sqlcsi/
 | `docs-lookup` | Agent + Skill | KB fixes, CU applicability, wait type research | `microsoft-learn` MCP |
 | `dump-analysis` | Agent + Skill | WinDbg / Mirrors commands for SQL Server dumps | WinDbg (external) |
 | `source-search` | Agent | Engine source code search across SQL 2016/2017/2019/2022/2025 | `msdata` / `csswiki` MCP |
+| `ag-failover-analysis` | Agent + Skill | AG failover: parse AlwaysOn.OUT/ERRORLOG/XEvent, classify stuck DBs, per-FO reports | [scripts/ag-failover-analysis/*](scripts/ag-failover-analysis/) |
+| `stuck-db-analysis` | Skill | Deep-dive stuck RESOLVING DBs: Cat A/B/C comparison, source code pipeline mapping | Pre-cached KB in `reference/` |
 
 **Why split agent / skill?** Agents are short entry files with `description` frontmatter so the router can match user intent. Skills hold the detailed step-by-step methodology and are loaded only when the matching agent activates, keeping context small.
 
@@ -60,6 +77,8 @@ sqlcsi/
 | 4 | `analyze dump <path>` | `dump-analysis` | Generate WinDbg/Mirrors commands for a SQL crash dump |
 | 5 | `search error <N>` | `source-search` | Search SQL Server source code for error definition + raising code |
 | 6 | `full analysis` | All (orchestrated) | Run 1 → 2 → 3 → 5 sequentially; produce combined report |
+| 7 | `analyze AG failover <path>` | `ag-failover-analysis` | Parse AlwaysOn.OUT + ERRORLOG + XEvent, detect FO incidents, per-DB status tables, trigger analysis |
+| 8 | `analyze stuck DB` | `stuck-db-analysis` | Cat A/B/C comparison, DatabaseSwitchRoles pipeline mapping, source code reference |
 
 ## Key Features
 
@@ -96,6 +115,19 @@ sqlcsi/
 - Function logic analysis
 - XEvent diagnostics discovery
 - HTML report with Azure DevOps links
+
+### AG Failover Analysis
+- Multi-phase pipeline: AlwaysOn.OUT → ERRORLOG → XEvent → SQL Server import → merge → report
+- Per-failover incident detection with 120s clustering
+- Per-host, per-DB status tables with DTC, Reverting, ABORT kill, NQ rollback columns
+- Trigger analysis: connection timeouts, WSFC errors (41xxx chain), lease termination, SYSTEM_UNHEALTHY
+- Old PRIMARY vs New PRIMARY identification from `conn_terminated` + `ag_directions`
+- Key Event Timeline per host with color-coded badges
+- WSFC Error Chain cascade diagram (41005→41034→41144→41143→41161)
+- Conclusion with trigger cause, IO context, per-AG outcome, per-host recovery summary
+- Both HTML (Catppuccin Mocha theme) and Markdown output
+- Stuck DB deep-dive: Cat A/B/C comparison table mapped to `DatabaseSwitchRoles` source code
+- Pre-cached source code KB: pipeline steps with line numbers, lock dependency, deadlock chains
 
 ## Prerequisites
 
