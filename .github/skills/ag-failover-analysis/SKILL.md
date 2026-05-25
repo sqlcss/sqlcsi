@@ -408,6 +408,172 @@ ORDER BY event_time
 - Any error-level messages or unexpected patterns
 - Messages mentioning specific database names may indicate where processing stalled
 
+### Phase 4b: Classify Failover Trigger — Lease Timeout vs Health Check vs Cluster Error
+
+For each failover incident, determine **WHY** the AG went offline. This is a critical
+first step before analyzing individual database behavior. The trigger type determines
+the investigation path.
+
+#### Step 1: Check ERRORLOG Error Numbers
+
+Search ERRORLOG for the specific error that triggered the failover:
+
+| Error | Message | Direction | Meaning |
+|-------|---------|-----------|---------|
+| **19419** | "WSFC did not receive a process event signal from **SQL Server**" | SQL → WSFC | **SQL Lease renewal timeout** — SQL Server failed to send the lease signal to WSFC. SQL was too busy (CPU/worker exhaustion) to schedule the lease thread. |
+| **19421** | "**SQL Server** did not receive a process event signal from the **WSFC**" | WSFC → SQL | **Diagnostics heartbeat lost** — WSFC health worker could not get sp_server_diagnostics results from SQL Server. Often caused by the same CPU pressure affecting both sides. |
+| **19407** | "The lease between AG and WSFC has expired" | — | Generic lease expiration message. Always accompanies 19419 or 19421. Not diagnostic on its own. |
+| **41005** | "WSFC cluster event notification operation failed" | — | **Cluster communication error** — WSFC internal issue, not SQL performance related. |
+| **1135** | "Cluster node was evicted from the WSFC cluster" | — | **Node eviction** — WSFC determined the node is unhealthy. May be network, storage, or OS-level issue. |
+| **41144** | "WSFC lease could not be renewed" | — | Lease could not be renewed — similar to 19419 but from a different code path. |
+
+**Important:** 19419 and 19421 can BOTH appear simultaneously. Check which one appears
+first — that indicates the primary failure direction.
+
+#### Step 2: Confirm with Cluster Log
+
+Cross-reference with the cluster log. The cluster log records the WSFC-side trigger:
+
+| Cluster Log Message | Trigger Type |
+|---------------------|-------------|
+| `[hadrag] Lease renewal failed with timeout error` | **SQL Lease renewal timeout** — SQL did not renew the lease in time |
+| `[hadrag] Lease renewal failed because the existing lease is no longer valid` | **SQL Lease renewal timeout** — lease already expired |
+| `[hadrag] Failure detected, diagnostics heartbeat is lost` | **Diagnostics heartbeat lost** — health worker could not get sp_server_diagnostics response |
+| `[hadrag] Availability Group is not healthy with given HealthCheckTimeout and FailureConditionLevel` | **Health check timeout** — sp_server_diagnostics returned unhealthy state |
+| `Node was removed from the active failover cluster membership` | **Node eviction (Error 1135)** — cluster-level issue |
+
+**The cluster log is the authoritative source** for trigger type classification.
+ERRORLOG error numbers alone can be ambiguous (19419 and 19421 may both appear).
+
+#### Step 3: Branch Based on Trigger Type
+
+```
+Trigger Type?
+│
+├─ Step 4: Extract perf counter from cluster log (ALL trigger types)
+│
+├─ SQL Lease renewal timeout (19419) ──────────┐
+├─ Diagnostics heartbeat lost (19421) ─────────┤
+├─ Health check timeout ───────────────────────┤
+│                                              │
+│                    ┌─────────────────────────┘
+│                    ▼
+│          *** Performance Investigation ***
+│          → Step 5: Analyze sp_server_diagnostics data
+│          → Step 6: Import SQLDIAG 5-sec data (if available)
+│          → Step 7: Detect sp_server_diagnostics gaps
+│          → Step 8: Classify CPU pattern (SQL vs OS vs Worker)
+│
+├─ Cluster error (1135 node eviction) ─────────┐
+├─ Cluster error (41005 WSFC comm failure) ─────┤
+│                                              │
+│                    ┌─────────────────────────┘
+│                    ▼
+│          *** Cluster / Infrastructure Investigation ***
+│          → Check perf counter: if CPU/IO normal, confirms not performance related
+│          → Check WSFC network, quorum, storage
+│          → Check cluster log for node heartbeat failures
+│          → Check Windows Event Log (System, FailoverCluster)
+│
+└─ Other / Unknown ────────────────────────────→ Investigate both paths
+```
+
+#### Step 4: Extract Perf Counter Data from Cluster Log
+
+**(For ALL trigger types — always do this step)**
+
+When any AG resource failure occurs, WSFC automatically dumps perf counter history
+(10-second sampling). This data is critical for ALL trigger types:
+- **Lease/health check timeout:** CPU% reveals whether it was SQL CPU, OS CPU, or IO
+- **Cluster errors (1135, 41005):** If CPU/IO are normal, confirms the issue is
+  infrastructure-related (network, quorum), not performance
+
+Search for these lines near the FO timestamp:
+
+```
+[hadrag] Lease timeout detected, logging perf counter data collected so far
+[hadrag] AG health check failed, logging perf counter data collected so far
+[hadrag] Date/Time, Processor time(%), Available memory(bytes), Avg disk read(secs), Avg disk write(secs)
+[hadrag] 5/19/2026 20:20:39.0, 100.000000, 973680615424.000000, 0.000235, 0.000183
+```
+
+Extract the CPU%, available memory, and disk latency values for every FO.
+This data is available for all trigger types, not just lease/health check.
+
+#### Step 5: Analyze sp_server_diagnostics Component Data
+
+**(Only for lease timeout / health check timeout triggers)**
+
+Query `sp_server_diagnostics_component_result` (from system_health XEvent, typically
+5-min interval) around each FO time (FO time ± 10 minutes, convert to UTC).
+
+Key fields to extract from each component's XML `<data>` element:
+
+| Component | XML Path | Key Fields | What to Look For |
+|-----------|----------|-----------|-----------------|
+| **SYSTEM** | `/system/@systemCpuUtilization`, `@sqlCpuUtilization` | sysCPU vs sqlCPU | **sysCPU high + sqlCPU high** = SQL CPU intensive. **sysCPU high + sqlCPU low** = OS process consuming CPU. |
+| **QUERY_PROCESSING** | `/queryProcessing/@maxWorkers`, `@workersCreated`, `@workersIdle`, `@pendingTasks` | Worker usage ratio | If `workersCreated` approaches `maxWorkers` (e.g. >80%), worker exhaustion risk. `pendingTasks > 0` = tasks waiting for workers. |
+| **IO_SUBSYSTEM** | `/ioSubsystem/@ioLatchTimeouts`, `@intervalLongIos`, `@totalLongIos` | IO pressure | Non-zero = IO bottleneck contributing to timeout |
+| **RESOURCE** | `/resource/@lastNotification` | Memory state | `RESOURCE_MEM_STEADY` = OK. `RESOURCE_MEMPHYSICAL_LOW` = memory pressure |
+
+#### Step 6: Import SQLDIAG 5-Second Data (if available)
+
+**(Only for lease timeout / health check timeout triggers)**
+
+Check for `FailoverCluster_health_XeLogs` directory or SQLDIAG XEL files containing
+`component_health_result` events (5-second interval, much finer than system_health's 5-min).
+
+**Note:** SQLDIAG XEL uses a different XML format than system_health:
+- Component name: lowercase (e.g. `system`, `query_processing`, `resource`)
+- XML path: `(/event/data[@name="component"]/value)` instead of `(/event/data[@name="component"]/text)`
+- State: `(/event/data[@name="state_desc"]/value)` instead of `(/event/data[@name="state"]/text)`
+
+Import with the same `import_ag_xevent.sql` script, then query with adjusted XPath.
+
+#### Step 7: Detect sp_server_diagnostics Gaps
+
+**(Only for lease timeout / health check timeout triggers)**
+
+If SQLDIAG 5-second data is available, calculate the interval between consecutive
+events for the same component. Normal interval = ~5 seconds.
+
+**Gaps > 7 seconds prove SQL Server thread scheduling was blocked** — the exact same
+mechanism that prevents the lease thread from renewing. The gap duration directly
+correlates with how long SQL Server was "frozen."
+
+Example query:
+```sql
+;WITH sys AS (
+  SELECT event_time, ROW_NUMBER() OVER (ORDER BY event_time) AS rn
+  FROM xe.raw_events
+  WHERE event_name = 'component_health_result'
+    AND CAST(event_data AS XML).value(
+      '(/event/data[@name="component"]/value)[1]','varchar(30)') = 'system'
+    AND event_time BETWEEN @start_utc AND @end_utc
+)
+SELECT DATEADD(HOUR, @utc_offset, a.event_time) AS local_time,
+  DATEDIFF(MILLISECOND, b.event_time, a.event_time) AS gap_ms,
+  CASE WHEN DATEDIFF(MILLISECOND, b.event_time, a.event_time) > 7000
+    THEN '*** GAP ***' ELSE '' END AS flag
+FROM sys a LEFT JOIN sys b ON a.rn = b.rn + 1
+ORDER BY a.event_time;
+```
+
+#### Step 8: Classify Each FO's Root Cause Pattern
+
+**(Only for lease timeout / health check timeout triggers)**
+
+Combine all evidence (cluster log perf counter + sp_server_diagnostics + gap detection)
+to classify each failover into one of these patterns:
+
+| Pattern | sysCPU | sqlCPU | Workers | Trigger | Root Cause |
+|---------|--------|--------|---------|---------|-----------|
+| **SQL CPU Intensive** | High (>90%) | **High (>80%)** | Normal | SQL Lease timeout | SQL queries/jobs consuming CPU → lease thread starved |
+| **OS CPU Occupied** | High (>90%) | **Low (<10%)** | Normal | SQL Lease timeout or Heartbeat lost | Non-SQL OS process consuming CPU → everything starved |
+| **Worker Exhaustion** | Low-Medium | Low | **>80% of max** | SQL Lease timeout | Worker pool near limit → lease thread cannot be scheduled |
+| **IO Bottleneck** | Normal | Normal | Normal | Heartbeat lost | Long IO stalls → sp_server_diagnostics blocked |
+| **Mixed** | Variable | Variable | Variable | Either | Combination of factors |
+
 ### Phase 5: Classify Each Database
 
 Combine ERRORLOG (Phase 2) and XEvent (Phase 4) evidence to classify each database.
