@@ -306,6 +306,45 @@ Run once per host. This creates database `ag_{case_id}` with shredded tables:
 **Important:** XEvent timestamps are **UTC**. ERRORLOG timestamps are **server local time**.
 Apply UTC offset when correlating (e.g. UTC+8: ERRORLOG 07:53 = XEvent 23:53 previous day).
 
+### Phase 3b: Import system_health and SQLDIAG XEvent
+
+In addition to AlwaysOn_health, import system_health and SQLDIAG XEvent for performance
+analysis (needed for Phase 4b trigger classification).
+
+**system_health** (per host):
+```
+sqlcmd -S localhost -E -v case_id="{case_id}" host="{hostname}" xel_path="{case_dir}/{host}/system_health*.xel" -i scripts/ag-failover-analysis/import_ag_xevent.sql
+```
+
+**SQLDIAG** (per host — check TWO locations):
+```
+# Location 1: Direct in host directory
+sqlcmd -S localhost -E -v case_id="{case_id}" host="{hostname}" xel_path="{case_dir}/{host}/*SQLDIAG*.xel" -i scripts/ag-failover-analysis/import_ag_xevent.sql
+
+# Location 2: FailoverCluster_health_XeLogs subdirectory (often has MORE files with longer history)
+sqlcmd -S localhost -E -v case_id="{case_id}" host="{hostname}" xel_path="{case_dir}/{host}/*FailoverCluster_health_XeLogs*/*.xel" -i scripts/ag-failover-analysis/import_ag_xevent.sql
+```
+
+**Why both locations?** The SQLDIAG files in the host directory are often the latest
+rollover files only (covering the last few hours). The `FailoverCluster_health_XeLogs`
+directory (from PSSDIAG/SQLLogScout collection) may contain older rollover files with
+data covering the incident time.
+
+**Note on event names and XML format differences:**
+
+| Source | Event Name | Component XML Path | State XML Path |
+|--------|-----------|-------------------|---------------|
+| system_health | `sp_server_diagnostics_component_result` | `(/event/data[@name="component"]/text)` | `(/event/data[@name="state"]/text)` |
+| SQLDIAG (FailoverCluster) | `component_health_result` | `(/event/data[@name="component"]/value)` | `(/event/data[@name="state_desc"]/value)` |
+
+The component values in SQLDIAG are **lowercase** (e.g. `system`, `query_processing`,
+`resource`, `io_subsystem`, `events`) vs system_health which uses **uppercase**
+(e.g. `SYSTEM`, `QUERY_PROCESSING`).
+
+Both can be queried via the `import_ag_xevent.sql` script — it loads raw XML into
+`xe.raw_events`. The XML parsing queries in Phase 4b must use the correct XPath
+based on which event source they are querying.
+
 ### Phase 4: XEvent Analysis Checklist
 
 For each failover incident, query these XEvent tables and check the following:

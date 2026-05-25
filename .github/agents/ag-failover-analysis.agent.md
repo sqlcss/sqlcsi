@@ -82,6 +82,26 @@ Creates database `ag_{case_id}` with shredded tables:
 
 **XEvent timestamps are UTC. ERRORLOG timestamps are server local time.**
 
+### Phase 3b: Import system_health and SQLDIAG XEvent
+
+Import additional XEvent sources for performance analysis (needed for Phase 4b):
+
+**Per host, run each that exists:**
+```
+# system_health
+sqlcmd -S localhost -E -v case_id="{case_id}" host="{hostname}" xel_path="{case_dir}/{host}/system_health*.xel" -i scripts/ag-failover-analysis/import_ag_xevent.sql
+
+# SQLDIAG (direct)
+sqlcmd -S localhost -E -v case_id="{case_id}" host="{hostname}" xel_path="{case_dir}/{host}/*SQLDIAG*.xel" -i scripts/ag-failover-analysis/import_ag_xevent.sql
+
+# SQLDIAG (FailoverCluster_health_XeLogs — often has more history)
+sqlcmd -S localhost -E -v case_id="{case_id}" host="{hostname}" xel_path="{case_dir}/{host}/*FailoverCluster_health_XeLogs*/*.xel" -i scripts/ag-failover-analysis/import_ag_xevent.sql
+```
+
+**Note:** SQLDIAG `component_health_result` uses different XML format than system_health
+`sp_server_diagnostics_component_result` — lowercase component names, different XPath.
+See SKILL.md §3b for details.
+
 ### Phase 2c: Merge ERRORLOG + XEvent Timeline
 
 ```
