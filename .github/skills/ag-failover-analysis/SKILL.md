@@ -539,6 +539,21 @@ Search for these lines near the FO timestamp:
 Extract the CPU%, available memory, and disk latency values for every FO.
 This data is available for all trigger types, not just lease/health check.
 
+**Include perf counter CPU detail in the report.** For each FO, list the 10-second
+CPU trend in a table. This is the most direct evidence of system state at the moment
+of failure. Example format:
+
+| # | Local Time | CPU Samples (10s intervals before FO) |
+|---|-----------|--------------------------------------|
+| 1 | 05-19 04:21 | `04:20:39→100% | 04:20:49→100% | 04:21:01→100% | 04:21:14→100% | 04:21:24→100%` |
+| 2 | 05-19 06:50 | `06:50:02→5%` (only 1 sample) |
+
+**Key patterns to highlight:**
+- **Sustained 97-100%** for 30+ seconds — classic CPU spike, lease thread starved
+- **Rapid climb** from moderate to >90% within 30-40 seconds — sudden workload burst
+- **Low CPU at sampling point** (e.g. 48%) — spike occurred between samples, need SQLDIAG 5s data
+- **SQLDIAG gaps** (100-125 seconds with no data) — proves SQL Server completely frozen
+
 #### Step 5: Analyze sp_server_diagnostics Component Data
 
 **(Only for lease timeout / health check timeout triggers)**
