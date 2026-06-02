@@ -75,7 +75,9 @@ wpr-allocation-analysis:
 
 wpr-cpu-comparison:
   - Compares two ETL traces (baseline vs problem)
-  - Uses diag-perf MCP cpu_compare_traces tool
+  - Uses WPA MCP mirror query pattern (queries each trace independently)
+  - Both ETL files must be opened in WPA simultaneously
+  - Method 1 (Thread-scoped) or Method 2 (Process-level) based on thread distribution
 
 5. Troubleshooting
 -------------------
