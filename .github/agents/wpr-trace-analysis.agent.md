@@ -16,11 +16,11 @@ then routes to the appropriate skill for analysis.
 
 ## Skill Registry
 
-| Skill | Purpose | Path |
-|-------|---------|------|
-| `wpr-cpu-analysis` | CPU hotspot investigation (Broad→Narrow 4-method workflow) | [skills/wpr-cpu-analysis/SKILL.md](../skills/wpr-cpu-analysis/SKILL.md) |
-| `wpr-cpu-comparison` | CPU baseline vs problem trace comparison | [skills/wpr-cpu-comparison/SKILL.md](../skills/wpr-cpu-comparison/SKILL.md) |
-| `wpr-allocation-analysis` | Allocation analysis (top types, call stacks) | [skills/wpr-allocation-analysis/SKILL.md](../skills/wpr-allocation-analysis/SKILL.md) |
+| Skill | Status | Purpose | Path |
+|-------|--------|---------|------|
+| `wpr-cpu-analysis` | ✅ | CPU hotspot investigation (Broad→Narrow 4-method workflow) | [skills/wpr-cpu-analysis/SKILL.md](../skills/wpr-cpu-analysis/SKILL.md) |
+| `wpr-cpu-comparison` | ✅ | CPU baseline vs problem trace comparison (Method 1/2) | [skills/wpr-cpu-comparison/SKILL.md](../skills/wpr-cpu-comparison/SKILL.md) |
+| `wpr-allocation-analysis` | 🚧 planned | Allocation analysis (top types, call stacks) — uses diag-perf MCP, not yet migrated to WPA MCP | — |
 
 ## WPA MCP Tools Reference
 
@@ -80,8 +80,7 @@ Ask the user for:
 1. **investigation_type** — What type of investigation?
    - **CPU 分析** — CPU hotspot analysis（high CPU, non-yielding, spinlock）
    - **CPU 对比** — Compare baseline vs problem trace（需要两个 ETL）
-   - **Allocation 分析** — 哪些类型分配最多内存
-   If not specified, ask: **"这是什么类型的调查？CPU / CPU 对比 / Allocation？"**
+   If not specified, ask: **"这是什么类型的调查？CPU 分析 / CPU 对比？"**
 
 2. **case_id** (optional) — Link to an existing case investigation.
    If provided, cross-reference with existing ERRORLOG/XEvent findings in `reports/`.
@@ -91,8 +90,7 @@ Ask the user for:
 | investigation_type | Read skill, then execute |
 |-------------------|--------------------------|
 | **CPU 分析** | Read [wpr-cpu-analysis/SKILL.md](../skills/wpr-cpu-analysis/SKILL.md), execute Phase 1→9 |
-| **CPU 对比** | Read [wpr-cpu-comparison/SKILL.md](../skills/wpr-cpu-comparison/SKILL.md), execute Phase 0→5 |
-| **Allocation 分析** | Read [wpr-allocation-analysis/SKILL.md](../skills/wpr-allocation-analysis/SKILL.md), execute Phase 1→4 |
+| **CPU 对比** | Read [wpr-cpu-comparison/SKILL.md](../skills/wpr-cpu-comparison/SKILL.md), execute Phase 0 → Method Selection → Phase 2→3 → Phase 4→7 |
 
 **IMPORTANT**: Read the ENTIRE skill file before starting execution. The skill contains
 the complete methodology, query patterns, SQL Server interpretation tables, and output
