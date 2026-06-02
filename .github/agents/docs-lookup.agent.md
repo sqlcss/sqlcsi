@@ -57,8 +57,13 @@ Each sub-agent:
 - `csswiki-repo_get_file_content(project, repositoryId, path, version: "main", versionType: "Branch")` → fetch full page
 - Known wiki repositoryId: SQLServerWindows = `d33c9417-111f-4539-99c6-de85ae587620`
 - Save to `reports/{case_id}_docs/csswiki_{title}.md`
-- **Return URL**: `https://dev.azure.com/Supportability/{project}/_wiki/wikis/{wiki-name}/{page-path}`
-- ⚠️ Do NOT use `wiki_get_page_content` — often fails with 404. Use `repo_get_file_content`.
+- **Return URL**: The search_wiki API does NOT return page IDs, and wiki_get_page often returns 404,
+  so do NOT fabricate URLs. Instead:
+  1. Record the search result `path` field as-is (e.g. `/SQLServerWindows/SQL-Server-On-Premise/.../Page-Name.md`)
+  2. In the saved markdown file, write `**Wiki Path:** {path}` (not a clickable URL)
+  3. In the synthesis report, write `Wiki Path: {path}` and note the user should search the wiki title to get the real URL
+- ⚠️ Do NOT use `wiki_get_page` or `wiki_get_page_content` — often fails with 404.
+  Use `repo_get_file_content` to fetch content via the git repo path.
 
 **msdata Wiki** (`msdata-*`):
 - `msdata-search_wiki(searchText)` → get results

@@ -71,6 +71,31 @@ DECLARE @case_id NVARCHAR(50) = N'{case_id}';
 The script is **idempotent** — re-running with the same `case_id` deletes old rows first.
 Multiple cases can coexist in the same database (filtered by `case_id`).
 
+### ⚠ CRITICAL: UTC → Local Time Conversion (During Analysis)
+
+XEL files store `@timestamp` in **UTC**. ERRORLOG uses **source SQL Server local time**.
+The import script stores timestamps **as-is in UTC**. You MUST convert to the source
+server's local time **during analysis queries** to align with ERRORLOG.
+
+**How to determine the offset:**
+1. Check the source server's timezone from ERRORLOG server info or `SELECT SYSDATETIMEOFFSET()`.
+2. Common offsets: China (UTC+8), US Eastern (UTC-5/-4), US Pacific (UTC-8/-7).
+3. If unknown, compare a known event that appears in both ERRORLOG and XEL to calculate the delta.
+
+**Apply offset in every analysis query:**
+```sql
+-- Example: source server is UTC+8 (China)
+SELECT DATEADD(HOUR, 8, event_time) AS local_time, ...
+FROM xe.errors WHERE ...
+
+-- Or create a view for convenience:
+CREATE OR ALTER VIEW xe.v_errors AS
+SELECT *, DATEADD(HOUR, 8, event_time) AS local_time FROM xe.errors;
+```
+
+**Never compare raw XEL UTC timestamps directly with ERRORLOG local times.**
+Always apply the offset first, or you will get wrong cross-correlation results.
+
 ### A.2 Run Analysis Queries
 
 After import, query via `sqlcmd`. Since database is per-case (`[xevent_{case_id}]`),

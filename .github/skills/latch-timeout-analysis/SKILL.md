@@ -30,8 +30,11 @@ DumpViewer is installed.
 
 ## Prerequisites
 
-**MANDATORY**: XEvent import must be **completed** before starting latch analysis.
+**MANDATORY**: XEvent import must be **completed** before XEvent analysis steps (B4).
+The sql-csi orchestrator starts import as a background task in Step 0.5 — it should
+already be running or finished by the time latch analysis reaches B4.
 Check via `Test-Path "reports/{case_id}_xevent_ready.flag"` or `get_terminal_output`.
+If not yet complete, proceed with B1-B3 (ERRORLOG-only steps) first.
 
 ---
 
@@ -372,40 +375,240 @@ if (Test-Path $mainHtml) {
 }
 ```
 
-## A3. Read DumpViewer Report (`main.html`)
+## A3. Read DumpViewer Report
 
-The main output is `{outputDir}/main.html`. Extract:
+DumpViewer generates `{outputDir}/Reports/` with HTML pages + AG Grid JSON data files.
+`main.html` is a shell that loads pages via iframe — **read the individual report files
+directly**, not main.html.
 
-1. **Dump metadata** — SQL Server version, dump time, trigger reason
-2. **Dump thread** — the thread that triggered the dump (match SPID from B1)
-3. **Owning task thread** — find `owning task` address from B1 in thread list
-4. **Owning task call stack** — what was it doing? (see B7 patterns)
-5. **Owning task wait type** — what was it waiting on?
-6. **Scheduler state** — runnable queue depth, is the owning task's scheduler busy?
-7. **Memory state** — memory clerk breakdown, RESOURCE_SEMAPHORE grants pending
-8. **Exception ring buffer** — recent errors before the dump
+### DumpViewer Report Structure
 
-### Cross-Reference with ERRORLOG
+| Group | Page | Data file | Key columns |
+|-------|------|-----------|-------------|
+| **Insights** | `Summary.html` | `Summary_*_json.js` | `id`, `message`, `details` |
+| **Insights** | `LatchTimeoutInsight.html` | (inline HTML) | Latch timeout diagnosis + call stacks |
+| **Insights** | `LatchListAndTree.html` | `LatchLis_Latches_*_json.js` | `latch_base`, `latch_class`, `exclusive_owner`, `owner_thread_id`, `waiter_count`, `owner_call_stack` |
+| **Insights** | `LatchWaiters.html` | `LatchWai_LatchWai_*_json.js` | `thread_id`, `task`, `latch_base`, `wait_type`, `wait_type_desc`, `acquired`, `releasor`, `call_stack` |
+| **Threads** | `ThreadDetails.html` | `ThreadDe_ThreadDe_*_json.js` | `thread_id`, `scheduler_id`, `worker`, `worker_state`, `worker_last_wait`, `task`, `task_state`, `call_stack` |
+| **Threads** | `BusyThreads.html` | `BusyThre_BusyThre_*_json.js` | `id`, `call_stack` |
+| **Threads** | `ExceptionThreads.html` | `Exceptio_Threadsr_*_json.js` | `id`, `call_stack` |
+| **Threads** | `LatchThreads.html` | `LatchThr_Threadsd_*_json.js` | `id`, `call_stack` |
+| **Threads** | `InParallelThreads.html` | `InParall_Parallel_*_json.js` | `id`, `call_stack` |
+| **Process Misc** | `SystemInfo.html` | (inline HTML tables) | OS, CPU, memory, uptime |
+| **Process Misc** | `DumpInfo.html` | (inline HTML tables) | Dump flags, streams |
+| **Process Misc** | `VASummary.html` | (inline HTML) | Virtual address space |
+| **Process Misc** | `ProcessEnvBlock.html` | (inline HTML) | Environment variables |
 
-| From ERRORLOG | Find in Dump |
-|---------------|-------------|
-| `owning task 0x{ADDR}` | Thread list → task address → full call stack |
-| `spid{NNN}` | Session list → session details + SQL text |
-| `Input Buffer` SQL | Confirm in dump's session input buffer |
-| `id 0x{LATCH_ADDR}` | Latch statistics / contention data |
+**Data file naming convention:** `{PagePrefix}_{TableName}_{N}_json.js`
+Each file is a JS var: `var var_{prefix}_json = [{ header: [...], data: [...] }];`
 
-## A4. DumpViewer Log Analysis
+### A3.1 Read `LatchTimeoutInsight.html` — Identify Dump Thread + Owner Thread
 
-The `DumpViewer_*.log` file (typically 100-200 KB) contains structured diagnostic
-output. Key sections to search:
+This page contains **pre-analyzed latch timeout diagnosis**. Read the full HTML and
+extract from the `<ul>` section:
 
-| Section | What to look for |
-|---------|-----------------|
-| `Schedulers` | Which scheduler has high runnable_tasks_count |
-| `Workers` | Worker thread status distribution |
-| `WaitingTasks` | All tasks currently waiting — find owning task |
-| `MemoryGrants` | Pending memory grants (confirmation of RESOURCE_SEMAPHORE) |
-| `LatchOwnership` | Who owns which latches |
+| Bullet | Field | ERRORLOG cross-reference |
+|--------|-------|-------------------------|
+| "Latch timeout occurred on latch" | **Latch address** + class | Must match ERRORLOG `id` |
+| "Timeout thread id" | **Dump trigger thread** | = ERRORLOG spid thread |
+| "wait type: N (EX)" | Latch wait mode | Must match ERRORLOG `type` field |
+| "N threads waiting" | Waiter count | Must match ERRORLOG latch timeout line count |
+| "exclusive owner thread id" | **Owner thread** | → key thread to investigate |
+| "exclusive owner task" | Owner task address | Must match ERRORLOG `owning task` |
+| "exclusive owner wait type" | **What the owner is stuck on** | Key root cause indicator |
+| "exclusive owner releasor" | SAME_TASK or other | SAME_TASK = self-blocking |
+
+**Output of this step:** Two thread IDs:
+- **Dump thread** (the waiter that triggered the dump)
+- **Owner thread** (the coordinator holding the latch — this is the one to investigate)
+
+### A3.2 Read `LatchListAndTree.html` — Latch Overview + Pattern Detection
+
+This page has TWO data sources:
+
+**A. AG Grid table** (`LatchLis_Latches_*_json.js`) — flat list of ALL active latches:
+```
+[latch_base, latch_class, exclusive_owner, owner_thread_id, m_count,
+ up, ex, dt, sh_count, kp_count, has_waiters, waiter_count, ..., owner_call_stack]
+```
+
+**B. Tree view** (inline `treeViewData` in the HTML) — hierarchical tree showing:
+```
+ParentId → Latch {address} {mode}   Waiters: {count}
+  ├── T{thread_id} PWAIT_LATCH_EX
+  ├── T{thread_id} PWAIT_LATCH_EX
+  ├── ...
+  └── T{thread_id} PWAIT_LATCH_EX  (Acquired)  ← owner if shown
+```
+
+Each tree node has `Tip` field containing the full call stack.
+
+**Step 1 — Latch overview from AG Grid:**
+
+| What to extract | Why |
+|----------------|-----|
+| Total latch count | How many concurrent latch contentions at dump time |
+| Total waiter count (sum all `waiter_count`) | Scale of system-wide impact |
+| Group by `latch_class` | DATASET_PARENT vs LATCH_BUF vs others |
+| `waiter_count` per latch | Confirms DOP of each parallel query |
+
+**Step 2 — Identify the timeout latch in the tree:**
+
+Find the latch node matching the address from A3.1. Example:
+```
+Latch 0x000003e0de3c9178 EX   Waiters: 39  ← THIS is our timeout latch
+```
+
+**Step 3 — Classify all latches and detect patterns:**
+
+For each latch in the grid, check `latch_class` and `owner_call_stack`:
+
+| Latch class | Scan type in owner stack | Interpretation |
+|-------------|------------------------|----------------|
+| `LATCH_DATASET_PARENT` | `HeapDataSetSession` | **Heap table** parallel scan (no clustered index) |
+| `LATCH_DATASET_PARENT` | `IndexDataSetSession` | **Index** parallel scan (clustered or nonclustered) |
+| `LATCH_BUF` | `BUF::AcquireLatch` | **Buffer pool page** latch (page-level contention) |
+| `LATCH_BUF` | `GhostExorciser` | Ghost record cleanup (background task) |
+
+If multiple DATASET_PARENT latches have the **same scan type** (e.g. all
+`IndexDataSetSession`), this suggests a **systemic pattern** affecting all parallel
+queries on that table type — not just the timeout query.
+
+If owner stacks differ (e.g. one is `HeapDataSetSession` with `CatchupPageRedos`,
+another is `IndexDataSetSession` with `LatchBase::Suspend`), these are **different
+queries** with **different root causes**.
+
+**Step 4 — Look for similar at-risk patterns:**
+
+Other latches with high `waiter_count` (≥ 30) that haven't timed out yet are **at risk**
+of timing out soon. Flag them for the report.
+
+### A3.3 Interpret Owner + Waiter Call Stacks for Timeout Latch
+
+Focus on the latch identified in A3.2 Step 2 (the timeout latch).
+
+**A. Owner call stack** (from LatchTimeoutInsight or LatchList `owner_call_stack`):
+
+This is the **most critical** stack — it tells you WHY the coordinator is stuck.
+Analyze using the B5 pattern table (see Basic section). Also check for new patterns
+not in the B5 table:
+
+| Owner stack pattern | Root cause | In B5? |
+|--------------------|-----------|----|
+| `SOS_Scheduler::SwitchContext` → `Sleep` | CPU saturation | ✅ |
+| `RESOURCE_SEMAPHORE` in stack | Memory grant wait | ✅ |
+| `PAGEIOLATCH` in stack | Buffer pool I/O | ✅ |
+| `LCK_M_*` in stack | Lock blocking | ✅ |
+| `CXPort::Open` | Exchange iterator wait | ✅ |
+| `WriteLog` / `WRITELOG` | Log flush wait | ✅ |
+| `CheckLogBlockReadComplete` → `CatchupPageRedos` | **Log redo catch-up I/O** | ❌ NEW |
+| `LatchBase::Suspend` (owner waiting on ANOTHER latch) | **Latch chain** | ❌ NEW |
+
+If the owner stack shows a pattern NOT in B5, document it as a new finding.
+
+**B. Waiter call stacks** (from tree view `Tip` fields):
+
+All waiters should show the same pattern — they are parallel workers blocked on the
+same DATASET_PARENT latch. Verify:
+
+1. All waiters have `LatchBase::Suspend` near the top
+2. All waiters have the same scan type (`HeapDataSetSession` or `IndexDataSetSession`)
+3. All waiters go through `FnProducerThread` → `SubprocEntrypoint` (= parallel workers)
+
+If any waiter has a **different** pattern, it's an anomaly worth investigating.
+
+**C. Cross-reference with ThreadDetails (A3.4):**
+
+Use the owner thread id from A3.1 to look up in `ThreadDe_ThreadDe_*_json.js`:
+
+```powershell
+Select-String -Path "{reportDir}\ThreadDe_ThreadDe_*_json.js" `
+  -Pattern '^\s*\[{owner_thread_id},' -Encoding UTF8 |
+  ForEach-Object { $_.Line.Substring(0, [Math]::Min($_.Line.Length, 500)) }
+```
+
+Extract: `scheduler_id`, `worker_state`, `worker_last_wait`, `task_state`.
+
+| worker_state | worker_last_wait | Means |
+|-------------|-----------------|-------|
+| SUSPENDED | `PWAIT_IO_COMPLETION` | Owner stuck on **I/O** |
+| SUSPENDED | `RESOURCE_SEMAPHORE` | Owner stuck on **memory grant** |
+| SUSPENDED | `LATCH_EX` | Owner stuck on **another latch** |
+| RUNNABLE | (any) | Owner waiting for **CPU** |
+
+### A3.4 Read Supporting Reports (Summary + SystemInfo + ThreadDetails)
+
+These provide context for the latch timeout analysis above.
+
+**A. Summary (`Summary_*_json.js`)** — Quick diagnostic overview:
+
+Look for these key counts (strip HTML tags from `message` field):
+- Exception threads, Latch threads, Parallel threads
+- Pending disk/network I/O, Blocking threads, Memory clerk issues
+
+**B. SystemInfo (`SystemInfo.html`)** — Parse inline HTML tables for:
+
+| Field | Why needed |
+|-------|-----------|
+| OS version, CPU count | Confirm 24-core → DOP 40 is excessive |
+| SQL Server version | Check if known fix exists in newer CU |
+| Dump time (local + UTC offset) | Cross-reference with ERRORLOG/XEvent timestamps |
+| System/Process uptime | Long uptime = possible memory fragmentation |
+
+**C. ThreadDetails (`ThreadDe_ThreadDe_*_json.js`)** — If not already queried in A3.3:
+
+Scheduler load distribution:
+```powershell
+$scheds = @{}
+Select-String -Path "{reportDir}\ThreadDe_ThreadDe_*_json.js" `
+  -Pattern '^\s*\[\d+,\s*\d+,' -Encoding UTF8 |
+  ForEach-Object {
+    if ($_.Line -match '^\s*\[\d+,\s*(\d+),') {
+      $s = $Matches[1]
+      if ($scheds.ContainsKey($s)) { $scheds[$s]++ } else { $scheds[$s] = 1 }
+    }
+  }
+$scheds.GetEnumerator() | Sort-Object { [int]$_.Value } -Descending |
+  Select-Object -First 10 | ForEach-Object { "$($_.Key): $($_.Value) threads" }
+```
+
+Worker state distribution:
+```powershell
+$states = @{}
+Select-String -Path "{reportDir}\ThreadDe_ThreadDe_*_json.js" `
+  -Pattern 'WORKER_STATE' -Encoding UTF8 |
+  ForEach-Object {
+    if ($_.Line -match '"(WORKER_STATE_\w+)"') {
+      $s = $Matches[1]
+      if ($states.ContainsKey($s)) { $states[$s]++ } else { $states[$s] = 1 }
+    }
+  }
+foreach ($kv in ($states.GetEnumerator() | Sort-Object { [int]$_.Value } -Descending)) {
+  Write-Host "$($kv.Key): $($kv.Value)"
+}
+```
+
+Interpretation:
+- **High SUSPENDED** (>70%) — normal during latch contention
+- **High RUNNABLE** (>20%) — CPU pressure
+- **High RUNNING** (>30%) — unusual, possible spinlock contention
+
+### A3.5 Cross-Reference Checklist
+
+After reading the above reports, verify:
+
+| From ERRORLOG | Where in DumpViewer | Match? |
+|---------------|---------------------|--------|
+| `owning task 0x{ADDR}` | A3.1 "exclusive owner task" + A3.3C ThreadDetails `task` | ✅/❌ |
+| `id 0x{LATCH_ADDR}` | A3.1 "latch timeout occurred on latch" + A3.2 `latch_base` | ✅/❌ |
+| `type {N}` (latch mode) | A3.1 "Current wait type" | ✅/❌ |
+| Thread count from `: N` | A3.1 "N threads waiting" + A3.2 tree `Waiters: N` | ✅/❌ |
+| `spid{NNN}` thread | A3.1 "Timeout thread id" | ✅/❌ |
+| XEvent `wait_resource` | A3.2 latch_base addresses in grid | ✅/❌ |
+| ERRORLOG `Input Buffer` SQL | A3.2 waiter stacks: HeapDataSet = heap, IndexDataSet = index | ✅/❌ |
+| Owner wait type from A3.3C | A3.1 "exclusive owner wait type" | ✅/❌ |
+
+**If any ❌ → investigate discrepancy before proceeding to A5.**
 
 ## A5. Advanced Root Cause Summary
 

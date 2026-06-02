@@ -105,6 +105,18 @@
     "icm-prod": {
       "type": "http",
       "url": "https://icm-mcp-prod.azure-api.net/v1/"
+    },
+    "diag-perf": {
+      "type": "stdio",
+      "command": "C:\\Program Files\\dotnet\\dotnet.exe",
+      "args": [
+        "C:\\Tools\\diag-perf-ai\\tools\\net10.0\\any\\Microsoft.Diagnostics.Analysis.AI.ModelContextProtocol.dll"
+      ]
+    },
+    "wpa": {
+      "type": "stdio",
+      "command": "C:\\Users\\lduan\\AppData\\Local\\Microsoft\\WindowsApps\\Microsoft.WindowsPerformanceAnalyzerInternal_g4ype1skzj3jy\\wpa-mcp.exe",
+      "args": ["1"]
     }
   }
 }

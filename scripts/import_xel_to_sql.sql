@@ -9,9 +9,9 @@
 -- =============================================================================
 
 -- Defaults (overridden by sqlcmd -v)
-:setvar case_id "2604300030000700"
-:setvar xel_path "C:\Temp\2604300030000700\system_health_0_*.xel"
-:setvar days "3"
+:setvar case_id "2606010030001676"
+:setvar xel_path "C:\Temp\2606010030001676\db02log0601\db02log519\system_health_0_*.xel"
+:setvar days "30"
 
 USE master;
 GO
@@ -193,6 +193,8 @@ PRINT '';
 PRINT '== Step 1: Load raw events ==';
 PRINT 'Path: ' + N'$(xel_path)';
 
+-- NOTE: XEL @timestamp is always UTC. Stored as-is.
+-- Convert to source server local time during ANALYSIS, not here.
 INSERT INTO xe.raw_events (case_id, event_name, event_time, event_data)
 SELECT
     N'$(case_id)',
