@@ -7,7 +7,7 @@ description: >-
   for "full analysis". Do NOT trigger for general SQL query writing, T-SQL syntax,
   DBA tasks, or query tuning.
 tools: [execute, read, edit, search, agent, todo, web, wpa/*, msdata/*, microsoft-learn/*, csswiki/*, bluebird-mcp-sql/*, bluebird-mcp-2022/*, bluebird-mcp-2025/*, bluebird-mcp-2019/*, bluebird-mcp-2017/*, bluebird-mcp-2016/*, icm-prod/*, enghub/*, azure-mcp/*]
-agents: [tss-log-analysis, ag-failover-analysis, wpr-trace-analysis, errorlog-analysis, import-xevent, analyze-xevent, docs-lookup, source-search, dump-analysis, latch-timeout-analysis]
+agents: [tss-log-analysis, ag-failover-analysis, wpr-trace-analysis, errorlog-analysis, import-xevent, analyze-xevent, docs-lookup, source-search, dump-analysis, latch-timeout-analysis, sql-av-analysis]
 ---
 
 # SQL-CSI: SQL Server Case Scene Investigation
@@ -36,6 +36,7 @@ For requests that don't need full investigation orchestration, route directly:
 | "analyze xevent", "what do the waits show" | `analyze-xevent` (import first if not done) |
 | "research error", "look up KB", "what causes WRITELOG wait" | `docs-lookup` |
 | "analyze dump", provides `.mdmp` / `.dmp` path | `dump-analysis` |
+| "analyze AV", "access violation", "c0000005", reverse-engineer hash/disjoint-set corruption, provides AV TTD/dump | `sql-av-analysis` |
 | "search error XXXX", "find raising code" | `source-search` |
 | "latch timeout", "ACCESS_METHODS_DATASET_PARENT", "latch contention" | `latch-timeout-analysis` |
 | "analyze WPR", "analyze ETL", "CPU profiling", provides `.etl` path | `wpr-trace-analysis` |
