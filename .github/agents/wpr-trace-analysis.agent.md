@@ -20,6 +20,7 @@ then routes to the appropriate skill for analysis.
 |-------|--------|---------|------|
 | `wpr-cpu-analysis` | ✅ | CPU hotspot investigation (Broad→Narrow 4-method workflow) | [skills/wpr-cpu-analysis/SKILL.md](../skills/wpr-cpu-analysis/SKILL.md) |
 | `wpr-cpu-comparison` | ✅ | CPU baseline vs problem trace comparison (Method 1/2) | [skills/wpr-cpu-comparison/SKILL.md](../skills/wpr-cpu-comparison/SKILL.md) |
+| `wpr-io-analysis` | ✅ | Disk/File I/O investigation (per-file/database aggregation, latency, by process/thread) | [skills/wpr-io-analysis/SKILL.md](../skills/wpr-io-analysis/SKILL.md) |
 | `wpr-allocation-analysis` | 🚧 planned | Allocation analysis (top types, call stacks) — uses diag-perf MCP, not yet migrated to WPA MCP | — |
 
 ## WPA MCP Tools Reference
@@ -80,7 +81,8 @@ Ask the user for:
 1. **investigation_type** — What type of investigation?
    - **CPU 分析** — CPU hotspot analysis（high CPU, non-yielding, spinlock）
    - **CPU 对比** — Compare baseline vs problem trace（需要两个 ETL）
-   If not specified, ask: **"这是什么类型的调查？CPU 分析 / CPU 对比？"**
+   - **IO 分析** — Disk/File I/O investigation（慢 IO、PAGEIOLATCH/WRITELOG、按文件聚合）
+   If not specified, ask: **"这是什么类型的调查？CPU 分析 / CPU 对比 / IO 分析？"**
 
 2. **case_id** (optional) — Link to an existing case investigation.
    If provided, cross-reference with existing ERRORLOG/XEvent findings in `reports/`.
@@ -91,6 +93,7 @@ Ask the user for:
 |-------------------|--------------------------|
 | **CPU 分析** | Read [wpr-cpu-analysis/SKILL.md](../skills/wpr-cpu-analysis/SKILL.md), execute Phase 1→9 |
 | **CPU 对比** | Read [wpr-cpu-comparison/SKILL.md](../skills/wpr-cpu-comparison/SKILL.md), execute Phase 0 → Method Selection → Phase 2→3 → Phase 4→7 |
+| **IO 分析** | Read [wpr-io-analysis/SKILL.md](../skills/wpr-io-analysis/SKILL.md), execute Phase 1→7 |
 
 **IMPORTANT**: Read the ENTIRE skill file before starting execution. The skill contains
 the complete methodology, query patterns, SQL Server interpretation tables, and output

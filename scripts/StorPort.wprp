@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  StorPort.wprp — adds Microsoft-Windows-StorPort miniport I/O timing to a WPR recording.
+  Use this so Disk Usage gets a reliable Storport_Disk_Service_Time
+  (Is_Storport_Duration_Reliable = true), which lets you split device time
+  vs disk-stack/filter time.
+
+  HOW TO USE IN THE WPR UI:
+    1. Open Windows Performance Recorder.
+    2. Click "Add Profiles..." (bottom-left).
+    3. Select this StorPort.wprp file.
+    4. Under "Select additional profiles for performance recording" a new group
+       "StorPort IO timing" appears — tick "StorPort IO timing".
+    5. ALSO keep the built-in "Disk I/O activity" and "File I/O activity" ticked.
+    6. Detail level = Verbose, then Start.
+
+  HOW TO USE FROM COMMAND LINE (recommended — self-contained, no built-ins):
+    wpr -start StorPort.wprp!SqlCsiStorPortIO -filemode
+    REM ... run the T-SQL BACKUP DATABASE here ...
+    wpr -stop out.etl
+
+  REQUIRES A PHYSICAL DISK. StorPort miniport timing comes from the real storage
+  miniport's IOPerfNotification. On a VM ("Msft Virtual Disk" / storvsc / vhdmp)
+  the synthetic miniport never fires it, so Is_Storport_Duration_Reliable stays
+  false and Storport_Disk_Service_Time = 0 no matter what. Test on a physical box.
+  Prefer SATA/SAS (storahci) over NVMe (stornvme) — some NVMe drivers also skip it.
+  Verify: Get-PhysicalDisk | Select FriendlyName, BusType  (must NOT be a virtual disk).
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="SQL-CSI" Comments="StorPort miniport IO timing">
+  <Profiles>
+
+    <!-- ============================================================
+         Self-contained profile: kernel Disk I/O + File I/O (SystemCollector)
+         PLUS StorPort miniport IO timing (EventCollector).
+         Tick ONLY this one profile in WPRUI — do NOT also tick the built-in
+         "Disk I/O activity"/"File I/O activity". Combining a custom EventCollector
+         profile with the built-in profiles makes WPR fail with
+         "cannot be started without any providers" (0xc5580612). This profile bundles
+         everything so no merge is needed.
+         ============================================================ -->
+
+    <!-- Kernel logger (NT Kernel) for Disk/File I/O + stacks.
+         Buffers doubled (512 x 1024 KB = 512 MB) to avoid dropped events —
+         the VM test dropped 656k events at 256 MB. -->
+    <SystemCollector Id="SC_Kernel" Name="SQL-CSI Kernel Collector">
+      <BufferSize Value="1024"/>
+      <Buffers Value="512"/>
+    </SystemCollector>
+
+    <!-- StorPort event collector (must come before any provider element).
+         Buffers doubled (128 x 1024 KB = 128 MB). -->
+    <EventCollector Id="EC_StorPort" Name="StorPort Event Collector">
+      <BufferSize Value="1024"/>
+      <Buffers Value="128"/>
+    </EventCollector>
+
+    <SystemProvider Id="SP_DiskFile">
+      <Keywords>
+        <Keyword Value="ProcessThread"/>
+        <Keyword Value="Loader"/>
+        <Keyword Value="DiskIO"/>
+        <Keyword Value="FileIO"/>
+        <Keyword Value="FileIOInit"/>
+        <Keyword Value="CpuConfig"/>
+      </Keywords>
+      <Stacks>
+        <Stack Value="DiskReadInit"/>
+        <Stack Value="DiskWriteInit"/>
+        <Stack Value="DiskFlushInit"/>
+        <Stack Value="FileCreate"/>
+        <Stack Value="FileRead"/>
+        <Stack Value="FileWrite"/>
+      </Stacks>
+    </SystemProvider>
+
+    <!-- StorPort miniport IO timing.
+         Name = the provider GUID (c4636a1e-...) rather than the friendly name
+         "Microsoft-Windows-StorPort" — on older OS (e.g. Server 2019 / 10.0.17763)
+         the friendly name may not resolve, leaving the EventCollector with no
+         providers and failing with 0xc5580612. The GUID always resolves.
+
+         Keyword = 0xFFFFFFFFFFFFFFFF (ALL). The earlier value 0x8 captured ZERO
+         timing events: a verified physical-SATA capture shows the per-I/O timing
+         events use much higher keyword bits, e.g.
+            Port/Dispatch    0x4000000000200000 / 0x0400000 / 0x40000000
+            Port/Completion  0x4000000007e00000 / 0x40000000c0000000
+            Port/Queue       0x4000000800000000
+            Isr/Completion   0x1000001000000000
+         0x8 matched none of these, so the provider was enabled but every
+         Dispatch/Completion event was filtered out (Is_Storport_Duration_Reliable
+         stayed false). Enabling all keywords guarantees the Dispatch↔Completion
+         pair that drives reliable storport service time. -->
+    <EventProvider Id="EP_StorPort" Name="c4636a1e-7986-4646-bf10-7bc3b4a76e8e" Level="4">
+      <Keywords>
+        <Keyword Value="0xFFFFFFFFFFFFFFFF"/>
+      </Keywords>
+    </EventProvider>
+
+    <Profile Id="SqlCsiStorPortIO.Verbose.Memory" Name="SqlCsiStorPortIO"
+             Description="SQL-CSI Disk+File IO + StorPort timing"
+             LoggingMode="Memory" DetailLevel="Verbose">
+      <Collectors Operation="Add">
+        <SystemCollectorId Value="SC_Kernel">
+          <SystemProviderId Value="SP_DiskFile"/>
+        </SystemCollectorId>
+        <EventCollectorId Value="EC_StorPort">
+          <EventProviders Operation="Add">
+            <EventProviderId Value="EP_StorPort"/>
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+
+    <Profile Id="SqlCsiStorPortIO.Verbose.File" Name="SqlCsiStorPortIO"
+             Description="SQL-CSI Disk+File IO + StorPort timing"
+             LoggingMode="File" DetailLevel="Verbose">
+      <!-- Fully self-contained (NOT Base=) — older WPR (e.g. Server 2019, 10.0.17763)
+           does not copy the EventCollector's <EventProviders> through Base inheritance,
+           so the File profile would start with a provider-less StorPort collector and
+           fail with "An Event session cannot be started without any providers". -->
+      <Collectors Operation="Add">
+        <SystemCollectorId Value="SC_Kernel">
+          <SystemProviderId Value="SP_DiskFile"/>
+        </SystemCollectorId>
+        <EventCollectorId Value="EC_StorPort">
+          <EventProviders Operation="Add">
+            <EventProviderId Value="EP_StorPort"/>
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+
+  </Profiles>
+</WindowsPerformanceRecorder>

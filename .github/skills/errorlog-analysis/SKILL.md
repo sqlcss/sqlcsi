@@ -251,6 +251,128 @@ LSN[:\s]*\(?(\d+:\d+:\d+)\)?
 
 ---
 
+## Step 4: Event Rate Timeline Analysis (Per-Minute Rate vs CPU Correlation)
+
+A powerful, often-overlooked technique: instead of only listing *which* errors occurred,
+count **how many of a given event happened per minute**, then line that rate up against the
+CPU timeline from `system_health`. This turns the ERRORLOG into a cheap time-series signal
+and frequently reveals the **trigger** of a high-CPU / THREADPOOL incident that error
+classification alone misses.
+
+> **Rule of thumb**: if the ERRORLOG has a lot of `Login succeeded` lines, run the per-minute
+> count *by default* — don't wait for a high-CPU symptom. The CPU correlation (4.4) is an
+> optional enrichment; the login-rate spike on its own already flags a connection storm.
+
+> Proven on case 2606010030001676 (AG secondary high CPU): per-minute `Login succeeded`
+> count jumped from ~17/min to **887/min** exactly one minute before CPU went 13% → 83%,
+> pinpointing a connection surge as the trigger. Comparing against the **same time window on
+> a prior day** showed the baseline was only 5-24/min, confirming the spike was anomalous.
+
+### 4.1 When to Use
+
+**Trigger this step automatically (don't wait for a high-CPU question) whenever:**
+
+- The ERRORLOG contains a **large volume of `Login succeeded`** entries (e.g. login auditing
+  is on and successful logins number in the thousands). High login volume alone is enough —
+  always do the per-minute breakdown to check for a connection/login storm, even if no one
+  has reported high CPU yet. A surge is often the hidden trigger behind CPU / THREADPOOL /
+  blocking incidents.
+- Any single recurring event (a specific `Error: <N>`, failed logins, dumps) appears in
+  **high counts** — count it per minute to find *when* it accelerated.
+
+**Also use when:**
+
+- High CPU / non-yielding / THREADPOOL exhaustion where the **cause is unclear**.
+- You suspect a **connection storm, login storm, error storm, or batch job** triggered it.
+
+### 4.2 Choose the Event to Count
+
+Any line that recurs with a timestamp works. Common high-value signals:
+
+| Event | Line pattern | What a spike means |
+|-------|-------------|--------------------|
+| Login rate | `Login succeeded for user` | Connection/login storm (app pool reset, LB switch, batch job) |
+| Failed login rate | `Login failed for user` | Auth storm, credential/brute-force, app misconfig |
+| Connectivity errors | `Error: 17830` / `Error: 18456` | Client connection failures cascading |
+| Specific error storm | `Error: <N>,` | When that error started accelerating |
+| Dump rate | `Stack Dump` / `SqlDump` | When the engine started faulting |
+
+### 4.3 Count Per Minute (Node.js — handles UTF-16 + large files)
+
+```bash
+node -e "
+const fs=require('fs');
+const file=process.argv[1];
+const pattern=new RegExp(process.argv[2]);   // e.g. 'Login succeeded'
+const b=fs.readFileSync(file);
+const t=b.toString(b[0]===0xFF?'utf16le':'utf8');
+const buckets={};
+for(const line of t.split(/\r?\n/)){
+  if(!pattern.test(line)) continue;
+  // ERRORLOG timestamp: 2026-06-01 10:35:33.12
+  const m=line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2})/);
+  if(!m) continue;
+  buckets[m[1]]=(buckets[m[1]]||0)+1;
+}
+for(const k of Object.keys(buckets).sort()) console.log(k, buckets[k]);
+" '<ERRORLOG_PATH>' 'Login succeeded'
+```
+
+PowerShell one-liner alternative (small/medium logs):
+
+```powershell
+Select-String -Path '<ERRORLOG_PATH>' -Pattern 'Login succeeded' |
+  ForEach-Object { if ($_.Line -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2})') { $Matches[1] } } |
+  Group-Object | Select-Object Name, Count
+```
+
+### 4.4 Pull the CPU Timeline (system_health scheduler_monitor) — Optional Enrichment
+
+If XEL is imported into SQL (see xevent-analysis skill), CPU per minute is:
+
+```sql
+-- Note: XEL timestamps are UTC; add server offset (+8h here) to match ERRORLOG local time
+SELECT DATEADD(HOUR,8,DATEADD(MINUTE, DATEDIFF(MINUTE,0,event_time),0)) AS minute_local,
+       MAX(sql_cpu_pct)     AS sql_cpu,
+       MIN(system_idle_pct) AS sys_idle
+FROM xe.scheduler
+WHERE sql_cpu_pct IS NOT NULL
+GROUP BY DATEDIFF(MINUTE,0,event_time)
+ORDER BY minute_local;
+```
+
+> **Time zone caution**: ERRORLOG timestamps are **server local time**; XEL `event_time` is
+> **UTC**. Convert one to the other before aligning, or the rate and CPU will look offset.
+
+### 4.5 Correlate and Establish a Baseline
+
+1. **Align** the per-minute event rate with the per-minute CPU on the same local-time axis.
+2. **Look for the lead/lag**: does the rate spike *just before* CPU rises (trigger) or
+   *after* (downstream symptom)? A rate spike one minute **before** CPU climb is strong
+   evidence of the trigger.
+3. **Establish a baseline** — re-run the same per-minute count on the **same clock window of
+   a prior, healthy day** (logs permitting). "887/min vs a 5-24/min baseline = ~50×" is far
+   more convincing than an absolute number alone.
+4. **Note saturation dips**: once workers exhaust, the login rate can *drop* (e.g. to 5/min)
+   because new connections can no longer complete login — that dip is itself a symptom, not
+   recovery.
+
+### 4.6 Output
+
+Produce a side-by-side table in the findings report:
+
+```markdown
+| 时间 | Login/分钟 | SQL CPU % | 对比基线(前一日同时段) |
+|------|-----------|-----------|----------------------|
+| 10:33 | 17  | 10% | 15 (正常) |
+| 10:34 | 147 | 13% | 12 |
+| 10:35 | 605 | 83% | 16 ← CPU 起跳 |
+| 10:36 | 887 | 74% | 19 ← 峰值 |
+| 10:47 | 5   | 54% | 18 ← worker 耗尽，新连接无法完成 login |
+```
+
+---
+
 ## Step 5: Generate Findings Report
 
 ### 5.1 If Script Was Used
@@ -446,6 +568,22 @@ Error 17836 → Could not establish connection to primary (Sev 20)
 Error 17832 → Connection handshake failed / duplicate (Sev 20)
 Error 19432 → Missing log block detected → log scan restart
 ```
+
+### Connection-Surge → High CPU / THREADPOOL Cascade (discovered in case 2606010030001676)
+Detected via **Step 4 per-minute rate analysis**, not by error classification:
+```
+Login succeeded rate 17→887/min  → connection storm (trigger; ~50× prior-day baseline)
+   ↓ (same minute / +1 min)
+SQL CPU 13% → 83%                 → compile storm + query execution burn CPU
+   ↓
+THREADPOOL / SOS_WORKER waits     → workers exhausted (pendingTasks > maxWorkers)
+   ↓
+Error 17830 burst                 → new connections can't complete login (rate dips to ~5/min)
+   ↓
+Error 8628 + deadlocks            → optimizer timeouts + downstream contention
+```
+Key lesson: the login-rate spike **led** the CPU rise by ~1 minute → it is the **trigger**,
+while deadlocks / schema-lock waits / 17830 are **downstream symptoms**.
 
 ## Appendix D: Edge Cases
 

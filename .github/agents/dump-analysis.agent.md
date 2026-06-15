@@ -1,24 +1,42 @@
 ---
 name: dump-analysis
 description: >-
-  Generate WinDbg Mirrors commands for SQL Server crash dump analysis. Maps errors
-  to subsystem-specific ring buffers and DMV-equivalent commands. Use when the user
-  says "analyze dump", "分析 dump", provides a .mdmp file path, or asks to generate
-  WinDbg commands for a SQL Server dump.
-tools: ['terminal', 'readFile', 'editFile']
+  Analyze SQL Server crash dumps via cdb.exe CLI automation or WinDbg GUI command
+  generation. Uses SqlCsScripts/Mirrors to query ring buffers, DMV-equivalents, and
+  subsystem state; falls back to native symbol/stack walking when mirrors are
+  unavailable. Use when the user says "analyze dump", "分析 dump", provides a
+  .mdmp file path, or asks to generate WinDbg commands for a SQL Server dump.
+tools: ['terminal', 'readFile', 'editFile', 'createFile']
 ---
 
-# Dump Analysis Skill
+# Dump Analysis Agent
 
-## Overview
+Orchestrates SQL Server crash dump investigation by running the skill methodology
+in sequence. Two analysis surfaces:
 
-This skill generates WinDbg Mirrors/SqlCsScripts commands for analyzing SQL Server
-crash dumps, and optionally parses dump analysis results pasted back by the user.
-It maps error subsystems to the correct ring buffer scripts and LINQ queries.
+- **Part 1 — SqlCsScripts/Mirrors** (`!execute` / `!evaluate` LINQ): rich, fast;
+  requires version-matched mirrors to load.
+- **Part 2 — Native dump-walking** (`dt` / `dx` / `.cxr` on raw symbols + stack
+  locals): works with no mirrors / unsupported builds / SQL 2019, whenever private
+  symbols load.
+
+## Skill Reference
+
+Read the full methodology from:
+[.github/skills/dump-analysis/SKILL.md](../skills/dump-analysis/SKILL.md)
+
+- **Part 1** (Steps 1–4): cdb.exe setup, subsystem→script mapping, error-specific
+  LINQ queries, result parsing, cdb CLI reference, DX frame/locals inspection.
+- **Part 2** (Methods 1–5): scheduler/worker/task extraction, latch timeout decode,
+  non-yield analysis, thread categorization, SQLOS enum resolution.
+
+Deep, source-grounded methods live in reference files (read on demand):
+- [.github/skills/dump-analysis/reference/latch_timeout.md](../skills/dump-analysis/reference/latch_timeout.md) — latch timeout (`m_count` decode, waiter-list walk, self-wait detection)
+- [.github/skills/dump-analysis/reference/non_yielding.md](../skills/dump-analysis/reference/non_yielding.md) — non-yielding / stall (`pTrack`, copied-stack `.cxr`)
 
 ## Activation Triggers
 
-Activate this skill when the user:
+Activate when the user:
 - Says "analyze dump", "分析 dump", "debug dump"
 - Provides a dump file path (`.mdmp`, `.dmp`)
 - Asks for WinDbg commands for a specific error
@@ -26,322 +44,139 @@ Activate this skill when the user:
 
 ## Required Inputs
 
-| Input | Type | Required | Description |
-|-------|------|----------|-------------|
-| `dump_path` | string | No | Path to dump file (for WinDbg launch command) |
-| `error_numbers` | int[] | No | Error numbers to focus analysis on |
-| `subsystem` | string | No | Subsystem hint: `HADR`, `MEMORY`, `SCHEDULER`, `LOCKING`, `IO`, `CONNECTIVITY` |
-| `call_stack_functions` | string[] | No | Function names from a known call stack |
-| `case_id` | string | No | Case identifier for output naming |
+| Input | Required | Description |
+|-------|----------|-------------|
+| `dump_path` | No | Path to dump file (`.mdmp` / `.dmp`) |
+| `error_numbers` | No | Error numbers to focus analysis on |
+| `subsystem` | No | `HADR`, `MEMORY`, `SCHEDULER`, `LOCKING`, `IO`, `CONNECTIVITY` |
+| `call_stack_functions` | No | Function names from a known call stack |
+| `case_id` | No | Case identifier for output naming |
 
-> At least one of `error_numbers`, `subsystem`, or `call_stack_functions` should be provided.
-> If none are provided, generate a general-purpose diagnostic script.
+> At least one of `error_numbers`, `subsystem`, or `call_stack_functions` should be
+> provided. If none are given, run a general-purpose triage script.
 
----
+## Orchestration Steps
 
-## Step 1: Generate Session Setup Commands
+### Phase 0: Path & Surface Selection
 
-Always start with extension loading and symbol setup:
-
-```windbg
--- ========================================
--- SQL-CSI Dump Analysis Script
--- Case: {case_id}
--- Generated: {timestamp}
--- ========================================
-
--- Open dump (if not already open)
--- windbgx /startmcp -z {dump_path}
-
--- Load symbols
-.symfix
-.reload /f
-
--- Load SqlCsScripts from symbol server
-!dcs_initsymsvr sqlservr
-!dcs_initsymsvr sqldk
-
--- Verify scripts loaded
-!execute
+```
+IF dump_path provided AND cdb.exe reachable → Path A (cdb.exe CLI, preferred)
+ELSE IF user says "generate commands"/"WinDbg" → Path B (WinDbg GUI block)
+ELSE IF user pastes WinDbg output → jump to Phase 3 (Parse Results)
+ELSE → ask user which path to use
 ```
 
----
+Verify cdb.exe (SKILL.md §Step 1.1). Default to **Part 1 (Mirrors)**; switch to
+**Part 2 (native walking)** when `!dcs_initsymsvr` fails, mirrors don't load, the
+build is unsupported (e.g. SQL 2019), or the dump is a latch-timeout / non-yield
+dump where stack-local walking is more direct.
 
-## Step 2: Determine Analysis Focus
+**Symbol path** (SKILL.md §Symbol Path): always use the machine's `_NT_SYMBOL_PATH`
+— on this workstation `srv*C:\Symbols*https://symweb.azurefd.net` (internal symweb has
+SQL private PDBs **and** the SqlCsScripts/Mirrors packages). **Do NOT hardcode
+`https://msdl.microsoft.com/download/symbols`** — the public store has neither.
+Resolve at runtime: `$sym = [Environment]::GetEnvironmentVariable('_NT_SYMBOL_PATH','User')`
+then emit `.sympath $sym`. An HTTP store must be last/alone in sympath (symweb only).
+VPN required for symweb.
 
-### 2.1 Subsystem-to-Script Mapping
+### Phase 0.5: Prepare DScript (SQL2016 JS scripts — one-time COM registration)
 
-Based on error numbers or explicit subsystem, select the appropriate Mirrors scripts:
+The SQL2016 JavaScript debug library at `C:\Tools\SQL2016\*.js` (`task.js`,
+`all_ios.js`, `callstack.js`, …) is run inside cdb/WinDbg via the **DScript**
+extension (`!dscript.run <script.js>`). These scripts give SOS-style, source-grounded
+per-thread/task/IO analysis even on builds where Mirrors don't load.
 
-| Subsystem | Error Ranges | Primary Ring Buffers | Primary Scripts | Secondary Scripts |
-|-----------|-------------|---------------------|-----------------|-------------------|
-| **HADR / AG** | 19001-19599, 35001-35999 | `EnumerateHadrDbMgrStateRingBufferRecords`, `EnumerateHadrArSignalStateRecords`, `EnumerateHadrDbMgrAPIRingBufferRecords`, `EnumerateHadrDbMgrCommitRingBufferRecords`, `EnumerateHadrTransportStateRingBufferRecords`, `EnumerateHadrLeaseWorkerRingBufferRecords`, `EnumerateHadrArPubishEventsRecords` | `HadronManager.Enumerate`, `HadronSyncWaiters.Enumerate` | `EnumerateConnectivityTraceRecords` |
-| **Memory / OOM** | 701-899, 8645, 17300 | `EnumerateMemoryNodeOOMRingRecords`, `EnumerateMemoryBrokerRingRecords`, `EnumerateMemoryBrokerClerkRingRecords` | `MemoryClerks.Enumerate`, `MemoryGrants.Enumerate`, `MemoryNodes.Enumerate`, `MemoryObjects.Enumerate` | `EnumerateSOSMemoryObjectRingRecords` |
-| **Scheduler / CPU** | 17883, 17884, 17888 | `EnumerateSchedulerRingRecords`, `EnumerateSchedulerMonitorRecords`, `EnumerateCpuPressureRingRecords`, `EnumerateCpuQuantumThiefRecords`, `EnumerateCpuStarvationStatsRecords`, `EnumerateNonYieldCopiedStackRecords` | `Schedulers.Enumerate`, `Workers.Enumerate`, `AnalyzeNonYieldingSchedulers.Enumerate` | `EnumerateAggSchedStatRecords` |
-| **Locking / Deadlock** | 1101-1299, 1205 | `EnumerateSpinlockBackoffRecords` | `Locks.Enumerate`, `Deadlocks.GetDeadlockDetails`, `WaitingTask.Enumerate`, `LatchContendedPages.Enumerate`, `LatchOwnership.Counts` | `OSWaitStatistics.Enumerate`, `OSLatchStatistics.Enumerate` |
-| **Connectivity / Login** | 17801-17830, 18401-18499 | `EnumerateConnectivityTraceRecords`, `EnumerateSNIRingBufferRecords` | `Sessions.Enumerate`, `Connections.Enumerate`, `SNIListeners.Enumerate`, `SNIErrors.Enumerate` | `Logins.Enumerate` |
-| **Storage / IO** | 601-699, 823, 824, 825, 833 | `EnumerateVirtualFileIoStatsRingBufferRecords` | `PendingIOs.Enumerate`, `Databases.Enumerate`, `Indexes.Enumerate` | `EnumerateHoBtFactoryRingBufferRecords` |
-| **Transaction Log** | 9001-9100 | — | `Databases.Enumerate`, `LogMgrLogRecords.Enumerate` | `PendingIOs.Enumerate` |
-| **Query Execution** | 8601-8699 | — | `CachedPlans.Enumerate`, `QueryPlans.Enumerate`, `QueryExecutionTrees.Enumerate`, `MemoryGrants.Enumerate` | `QueryStats.Enumerate` |
-| **General** | (any) | `EnumerateExceptionRingRecords` | `Sessions.Enumerate`, `Threads.All`, `Schedulers.Enumerate`, `DbccInputBuffers.Enumerate` | `ProcessSummary.Enumerate`, `Times.DumpTime` |
+> **task.js** — per-thread SOS_Task summary (SPID, scheduler, **Worker state**,
+> wait type, **BLOCKERS** chain). Runs against the **current thread** — `~<TID>s`
+> first. Decisive for "truly stuck (SUSPENDED) vs just queued for CPU (RUNNABLE)".
+> **all_ios.js** — enumerates pending IOs + per-IO latency. **Requires a FULL/filter
+> dump** (`.dump /ma`); on a **minidump** it fails with
+> `0x8007001E - Cannot read from virtual address` (pending-IO globals not captured).
 
-### 2.2 Always-Include Commands
+**DScript needs a one-time COM self-registration that requires admin.** Once done it
+persists machine-wide in HKLM and **every later run is non-elevated (no UAC)**.
 
-These commands provide essential context regardless of subsystem:
+1. **Check if already registered** (no admin needed):
+   ```powershell
+   $n = (Get-ChildItem 'HKLM:\SOFTWARE\Classes\CLSID' -EA SilentlyContinue |
+         Where-Object { (Get-ItemProperty $_.PSPath -EA SilentlyContinue).'(default)' -match 'DSCRIPT' }).Count
+   "DScript CLSIDs in HKLM: $n"   # 4 == registered, ready to use non-elevated
+   ```
+2. **Locate DScript.dll** (ships with the WinDbg Store build):
+   ```powershell
+   $dscript = Get-ChildItem 'C:\Program Files\WindowsApps' -Recurse -Filter 'DScript.dll' -EA SilentlyContinue |
+              Where-Object FullName -match '\\amd64\\pri\\' | Select-Object -First 1 -Expand FullName
+   ```
+3. **If not registered (count < 4) → register once, ELEVATED.** DScript self-registers
+   when first `.load`ed inside an **elevated** cdb. Run a throwaway elevated cdb that
+   loads the DLL and runs any `!dscript.run` (a UAC prompt appears **once**):
+   ```powershell
+   # write a tiny .cdb that loads DScript + runs a script, then quits
+   @"
+   .load "$dscript"
+   !dscript.run C:\Tools\SQL2016\task.js
+   q
+   "@ | Set-Content C:\Temp\dscript_reg.cdb
+   Start-Process '<cdb.exe path>' -Verb RunAs -ArgumentList @(
+     '-z','<any SQL dump>','-cf','C:\Temp\dscript_reg.cdb','-G','-lines')
+   ```
+   After it runs once, the 4 CLSIDs are in HKLM permanently.
+4. **From then on (this machine or any machine already prepared) run non-elevated.**
+   `!dscript.run` auto-loads DScript (prints `--- Loading DScript`); the explicit
+   `.load "<path with spaces>"` line may fail (cdb mangles quoted spaces) but is
+   harmless since auto-load covers it.
 
-```windbg
--- Dump metadata
-!execute Times.DumpTime
-!execute Times.SqlUptime
-!execute ProcessSummary.Enumerate
+> If `Test-Path 'HKLM:\SOFTWARE\Classes\CLSID\...'` already shows 4 DScript CLSIDs,
+> **skip steps 2–3** and use the scripts directly — no UAC.
 
--- Exception ring buffer (always check first)
-!evaluate (execute SOSRingBuffers.EnumerateExceptionRingRecords).OrderByDescending(r => r.position).Take(50)
+### Phase 1: Triage
 
--- Active sessions
-!evaluate (execute Sessions.Enumerate).Where(s => s.is_user_process == true).Take(50)
+Run the triage script from SKILL.md §Multi-Phase Pattern (Phase 1):
+dump metadata + uptime + ProcessSummary + exception ring buffer top 50.
 
--- Top memory consumers
-!evaluate (execute MemoryClerks.Enumerate).GroupBy(m => m.clerk_type_name, q => q.pages_kb).Select(m => new {m.key, m.Sum(y => y)}).OrderByDescending(m => m.item2).Take(10)
-
--- Scheduler overview
-!execute Schedulers.Enumerate
-
--- Wait stats snapshot
-!execute OSWaitStatistics.Enumerate
-
--- Trace flags
-!execute TraceFlags.Enumerate
+```
+cdb -z {dump} -G -logo reports/{case_id}_triage.txt -cf reports/{case_id}_triage.cdb
 ```
 
----
+Parse output → extract error numbers, subsystem hint, top call-stack functions.
 
-## Step 3: Generate Error-Specific Commands
+### Phase 2: Subsystem Deep Dive
 
-For each error number, generate targeted queries:
+Use SKILL.md §Step 2 (subsystem→script mapping) and §Step 3 (error-specific
+queries) to build a `{case_id}_deepdive.cdb` script, then run it.
 
-### 3.1 Exception Ring Buffer — Filtered by Error
+- **Mirrors available** → Part 1 deep-dive blocks (HADR / Memory / Scheduler / Locking).
+- **Mirrors unavailable** → Part 2 native methods:
+  - Latch timeout → Method 2 (`m_count` decode + waiter-list walk + **walk the EX
+    owner's real stack** to find why it won't release — log/data IO, preemptive, etc.;
+    the latch timeout is usually a symptom). ⚠️ In minidumps trust the owner thread
+    stack, NOT the stale `SOS_Task.m_State`/`m_LastWaitType` fields.
+    Read [reference/latch_timeout.md](../skills/dump-analysis/reference/latch_timeout.md) first.
+  - Non-yield / 17883 / 17884 → Method 3 (`pTrack` + copied-stack `.cxr`).
+    Read [reference/non_yielding.md](../skills/dump-analysis/reference/non_yielding.md) first.
+  - "What is every thread doing?" → Method 4 (`!uniqstack` + categorization).
+  - Scheduler/worker enumeration → Method 1; enum names → Method 5.
 
-```windbg
--- All occurrences of error {error_number}
-!evaluate (execute SOSRingBuffers.EnumerateExceptionRingRecords).Where(r => r.m_error == {error_number}).OrderByDescending(r => r.position)
+### Phase 3: Targeted Follow-up & Parse Results
 
--- With call stack expansion
-!evaluate (execute SOSRingBuffers.EnumerateExceptionRingRecords).Where(r => r.m_error == {error_number}).Select(r => new {r.position, r.m_error, r.m_severity, r.m_state, r.m_throwing_task, r.m_origin, r.stack_frames.Nested()})
+Run specific queries for task addresses / session IDs found in Phase 2
+(SKILL.md §Step 4). For deep frame inspection use the DX frame/locals technique
+(SKILL.md §Inspecting Per-Frame Local Variables).
 
--- By severity range (find related high-severity errors)
-!evaluate (execute SOSRingBuffers.EnumerateExceptionRingRecords).Where(r => r.m_severity >= 16).OrderByDescending(r => r.position).Take(30)
-```
+### Phase 4: Compile Findings
 
-### 3.2 Exception Ring — Cross-Reference by Task
+Write findings per SKILL.md §Step 4.4 → `reports/{case_id}_dump_findings.md`.
+Return structured `DUMP_FINDINGS` (errors / call_stack_functions / server_state)
+for downstream source-code search.
 
-When a specific task address is known (from previous query results):
+## Output Files
 
-```windbg
--- All exceptions from the same task
-!evaluate (execute SOSRingBuffers.EnumerateExceptionRingRecords).Where(r => r.m_throwing_task == {task_address}).OrderByDescending(r => r.position)
+1. `reports/{case_id}_triage.cdb` / `_triage.txt` — triage script + raw output
+2. `reports/{case_id}_deepdive.cdb` / `_deepdive.txt` — deep-dive script + output
+3. `reports/{case_id}_dump_findings.md` — parsed findings report
 
--- Follow task → worker → scheduler chain
-!evaluate (execute SOSRingBuffers.EnumerateExceptionRingRecords).Where(r => r.m_throwing_task != nullptr && r.m_throwing_task.m_pWorker != nullptr && r.m_throwing_task.m_pWorker.m_pSched != nullptr && r.m_throwing_task.m_pWorker.m_pSched.m_id == {scheduler_id}).OrderByDescending(r => r.position)
-```
+## Error Handling
 
-### 3.3 Subsystem-Specific Deep Dives
-
-**HADR Deep Dive:**
-```windbg
--- AG manager state
-!execute HadronManager.Enumerate
-
--- DB manager state transitions
-!evaluate (execute SOSRingBuffers.EnumerateHadrDbMgrStateRingBufferRecords).OrderByDescending(r => r.position).Take(50)
-
--- AR API calls (function entry/exit)
-!evaluate (execute SOSRingBuffers.EnumerateHadrDbMgrAPIRingBufferRecords).OrderByDescending(r => r.position).Take(50)
-
--- Transport state (network issues between replicas)
-!evaluate (execute SOSRingBuffers.EnumerateHadrTransportStateRingBufferRecords).OrderByDescending(r => r.position).Take(30)
-
--- Lease worker (cluster communication)
-!evaluate (execute SOSRingBuffers.EnumerateHadrLeaseWorkerRingBufferRecords).OrderByDescending(r => r.position).Take(30)
-
--- Commit ring buffer (commit latency)
-!evaluate (execute SOSRingBuffers.EnumerateHadrDbMgrCommitRingBufferRecords).OrderByDescending(r => r.position).Take(30)
-
--- Sync waiters (sessions waiting for sync commit)
-!execute HadronSyncWaiters.Enumerate
-```
-
-**Memory Deep Dive:**
-```windbg
--- OOM ring buffer
-!evaluate (execute SOSRingBuffers.EnumerateMemoryNodeOOMRingRecords).OrderByDescending(r => r.position)
-
--- Memory broker notifications
-!evaluate (execute SOSRingBuffers.EnumerateMemoryBrokerRingRecords).OrderByDescending(r => r.position).Take(30)
-
--- Memory clerks grouped by type
-!evaluate (execute MemoryClerks.Enumerate).GroupBy(m => m.clerk_type_name, q => q.pages_kb).Select(m => new {m.key, m.Sum(y => y)}).OrderByDescending(m => m.item2).Take(20)
-
--- Memory grants waiting
-!evaluate (execute MemoryGrants.Enumerate).Where(g => g.grant_memory_kb == 0)
-
--- Memory nodes
-!execute MemoryNodes.Enumerate
-```
-
-**Scheduler Deep Dive:**
-```windbg
--- Non-yielding scheduler analysis
-!execute AnalyzeNonYieldingSchedulers.Enumerate
-
--- Scheduler ring buffer
-!evaluate (execute SOSRingBuffers.EnumerateSchedulerRingRecords).OrderByDescending(r => r.position).Take(50)
-
--- CPU pressure
-!evaluate (execute SOSRingBuffers.EnumerateCpuPressureRingRecords).OrderByDescending(r => r.position).Take(20)
-
--- Workers by status
-!evaluate (execute Workers.Enumerate).GroupBy(w => w.status, q => q).Select(q => new {q.key, q.Count()})
-
--- Scheduler details
-!evaluate (execute Schedulers.Enumerate).Where(s => s.is_hidden == false)
-```
-
-**Locking Deep Dive:**
-```windbg
--- Deadlock details
-!execute Deadlocks.GetDeadlockDetails
-
--- Waiting tasks
-!execute WaitingTask.Enumerate
-
--- Lock contention
-!evaluate (execute Locks.Enumerate).Where(l => l.lock_count > 0).Take(50)
-
--- Latch contended pages
-!execute LatchContendedPages.Enumerate
-
--- Spinlock backoff
-!evaluate (execute SOSRingBuffers.EnumerateSpinlockBackoffRecords).OrderByDescending(r => r.position).Take(30)
-```
-
----
-
-## Step 4: Parse Dump Results (Manual Handoff)
-
-When the user pastes WinDbg output back, extract:
-
-### 4.1 From Exception Ring Buffer Output
-
-Look for patterns:
-```
-| record | position | m_error | m_severity | m_state | ... | m_throwing_task | m_origin | stack_frames |
-```
-
-Extract:
-- `error_numbers` — unique error numbers found
-- `task_addresses` — unique throwing task addresses
-- `call_stack_functions` — function names from stack frames
-- `error_origins` — EX_ORIGIN_RAISE, EX_ORIGIN_THROW, etc.
-
-### 4.2 From HADR Ring Buffer Output
-
-Look for state transitions:
-- `PRIMARY → RESOLVING` — failover initiated
-- `RESOLVING → SECONDARY` — became secondary
-- `SECONDARY → PRIMARY` — failover completed
-- Note timestamps for correlation with errorlog timeline
-
-### 4.3 From Memory/Scheduler Output
-
-Flag:
-- `runnable_tasks_count > 0` on multiple schedulers → CPU pressure
-- `work_queue_count > 0` → worker thread exhaustion
-- Memory clerks with unusually large allocations
-- Memory grants waiting (grant_memory_kb == 0)
-
-### 4.4 Compile Findings
-
-```markdown
-## Dump Analysis Findings
-
-### Exception Summary
-- {N} unique errors found in exception ring buffer
-- Most frequent: Error {XXXX} ({count} occurrences)
-- Most recent: Error {YYYY} at position {pos}
-
-### Call Stack Functions (for source code search)
-- {ClassName::FunctionName} — raises Error {XXXX}
-- {ClassName::FunctionName2} — caller of above
-
-### Server State at Dump Time
-- Memory pressure: {YES/NO}
-- Scheduler pressure: {YES/NO}
-- HADR state: {state}
-- Active sessions: {count}
-
-### Errors for Code Search
-- HIGH: {error_number} (from call stack, confirmed in ring buffer)
-- MEDIUM: {error_number} (in ring buffer, no call stack)
-```
-
-Save to `reports/{case_id}_dump_findings.md`
-
----
-
-## LINQ Query Rules Reference
-
-### Value Comparison Syntax
-
-| Type | Syntax | Example |
-|------|--------|---------|
-| Numeric | `==`, `!=`, `>`, `<` | `r.m_error == 19433` |
-| Hex address | `0x` prefix | `r.m_throwing_task == 0x00000228c8b30008` |
-| Enum string | Double quotes | `r.m_origin == "EX_ORIGIN_RAISE"` |
-| String | Single quotes | `r.name == 'value'` |
-| String search | `.Contains()` | `b.text.Text.Contains("keyword")` |
-| Null pointer | `== nullptr` | `w.task == nullptr` |
-| Boolean | `== true/false` | `r.is_hidden == true` |
-
-### Column Names
-
-> **CRITICAL**: Use **snake_case** in LINQ `.Where()` filters, NOT PascalCase C++ names.
-> Example: `m_throwing_task` (correct), NOT `m_ThrowingTask` (wrong).
->
-> Alternative: access raw C++ names via `.Record`: `r.Record.m_ThrowingTask`
-
-### Sorting
-
-> **Ring buffers**: ALWAYS sort by `position` descending.
-> **Other enumerations**: Sort by meaningful key (session_id, timestamp, etc.).
-
-### Chaining with `lastResult`
-
-```windbg
-!execute Sessions.Enumerate
-!evaluate lastResult.Where(s => s.session_id == 87)
-!evaluate lastResult.GroupBy(s => s.HostName, q => q).Select(q => new {q.Key, q.Count()})
-```
-
----
-
-## Output Format
-
-### For User (Manual Execution)
-
-Output a single, copy-pasteable command block with:
-1. Setup commands (symbols, extension loading)
-2. Always-include commands (dump metadata, exception ring, memory top 10)
-3. Error-specific commands (filtered by error numbers)
-4. Subsystem deep-dive commands
-5. Comments explaining what each command does
-
-### For Workflow 4 (Programmatic)
-
-Return structured findings for source code search:
-```
-DUMP_FINDINGS:
-  errors: [19433, 35206]
-  call_stack_functions: ["WsfcIsAgIntactInWsfc", "ComputeInitialStateInWsfc"]
-  server_state: {memory_pressure: false, scheduler_pressure: false, hadr_state: "RESOLVING"}
-```
+If any cdb.exe command fails or symbols won't load, stop and report verbatim — do
+NOT retry silently or fabricate results. If private symbols won't load at all,
+fall back to `kn` + `!analyze -v` only (SKILL.md Part 2 decision table).

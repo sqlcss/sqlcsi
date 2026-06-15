@@ -53,7 +53,8 @@ The script creates database `[xevent_analyze]` with schema `[xe]` and these phys
 | `xe.diagnostics` | Shredded `sp_server_diagnostics_component_result` | `component`, `state_desc`, `data_xml` |
 | `xe.scheduler` | Shredded `scheduler_monitor_*` | `sql_cpu_pct`, `system_idle_pct`, `nonyielding_count` |
 | `xe.deadlocks` | Shredded `xml_deadlock_report` | `deadlock_xml` |
-| `xe.connectivity` | Shredded `connectivity_ring_buffer_recorded` | `error_code`, `conn_type` |
+| `xe.connectivity` | Shredded `connectivity_ring_buffer_recorded` | `conn_type`, `total_login_time_ms`, `sspi_processing_ms`, `ssl_processing_ms`, + 15 sub-timer fields |
+| `xe.login_timers` | Shredded `process_login_finish` (custom session) | `is_success`, `total_login_time_ms`, `sspi_*`, `ssl_*`, `fedauth_*`, `application_name` |
 
 **Usage:**
 ```bash
@@ -144,9 +145,89 @@ WHERE case_id = '{case_id}' ORDER BY event_time
 
 **Connectivity summary:**
 ```sql
-SELECT error_code, conn_type, COUNT(*) AS cnt
+SELECT sni_consumer_error, os_error, conn_type, tds_flags, COUNT(*) AS cnt
 FROM xe.connectivity WHERE case_id = '{case_id}'
-GROUP BY error_code, conn_type ORDER BY cnt DESC
+GROUP BY sni_consumer_error, os_error, conn_type, tds_flags ORDER BY cnt DESC
+```
+
+**Login timer summary (slow logins from connectivity ring buffer):**
+```sql
+SELECT TOP 20
+    event_time, state, total_login_time_ms,
+    login_task_enqueued_ms AS enqueue, network_reads_ms AS net_read,
+    ssl_processing_ms AS ssl, ssl_secure_calls_ms AS ssl_api,
+    sspi_processing_ms AS sspi, sspi_secure_calls_ms AS sspi_api,
+    find_login_ms, logon_triggers_ms, exec_classifier_ms,
+    sni_consumer_error AS error, remote_host
+FROM xe.connectivity
+WHERE case_id = '{case_id}' AND total_login_time_ms > 0
+ORDER BY total_login_time_ms DESC
+```
+
+**Login timer bottleneck distribution:**
+```sql
+SELECT
+    CASE
+        WHEN sspi_processing_ms > total_login_time_ms * 0.5 THEN 'SSPI/AD Auth'
+        WHEN ssl_processing_ms > total_login_time_ms * 0.5 THEN 'SSL/TLS'
+        WHEN network_reads_ms > total_login_time_ms * 0.5 THEN 'Network Read'
+        WHEN login_task_enqueued_ms > total_login_time_ms * 0.5 THEN 'Thread Starvation'
+        WHEN login_trigger_and_rg_ms > total_login_time_ms * 0.5 THEN 'Login Trigger/RG'
+        ELSE 'Mixed/Other'
+    END AS bottleneck,
+    COUNT(*) AS cnt, AVG(total_login_time_ms) AS avg_ms, MAX(total_login_time_ms) AS max_ms
+FROM xe.connectivity
+WHERE case_id = '{case_id}' AND total_login_time_ms > 100
+GROUP BY CASE
+    WHEN sspi_processing_ms > total_login_time_ms * 0.5 THEN 'SSPI/AD Auth'
+    WHEN ssl_processing_ms > total_login_time_ms * 0.5 THEN 'SSL/TLS'
+    WHEN network_reads_ms > total_login_time_ms * 0.5 THEN 'Network Read'
+    WHEN login_task_enqueued_ms > total_login_time_ms * 0.5 THEN 'Thread Starvation'
+    WHEN login_trigger_and_rg_ms > total_login_time_ms * 0.5 THEN 'Login Trigger/RG'
+    ELSE 'Mixed/Other'
+END ORDER BY cnt DESC
+```
+
+**process_login_finish analysis (custom session — includes successful logins):**
+```sql
+-- Success/failure distribution
+SELECT is_success, COUNT(*) AS cnt,
+       AVG(total_login_time_ms) AS avg_ms, MAX(total_login_time_ms) AS max_ms
+FROM xe.login_timers WHERE case_id = '{case_id}'
+GROUP BY is_success
+
+-- Top 20 slowest logins (all, including successful)
+SELECT TOP 20
+    event_time, is_success, error, spid, total_login_time_ms,
+    login_task_enqueued_ms AS enqueue, network_reads_ms AS net_read,
+    ssl_processing_ms AS ssl, sspi_processing_ms AS sspi,
+    sspi_secure_calls_ms AS sspi_api, find_login_ms,
+    application_name, driver_name, client_hostname
+FROM xe.login_timers
+WHERE case_id = '{case_id}' AND total_login_time_ms > 0
+ORDER BY total_login_time_ms DESC
+
+-- Bottleneck distribution for successful logins
+SELECT
+    CASE
+        WHEN sspi_processing_ms > total_login_time_ms * 0.5 THEN 'SSPI/AD Auth'
+        WHEN ssl_processing_ms > total_login_time_ms * 0.5 THEN 'SSL/TLS'
+        WHEN network_reads_ms > total_login_time_ms * 0.5 THEN 'Network Read'
+        WHEN login_task_enqueued_ms > total_login_time_ms * 0.5 THEN 'Thread Starvation'
+        WHEN fedauth_processing_ms > total_login_time_ms * 0.5 THEN 'FedAuth/AAD'
+        ELSE 'Mixed/Other'
+    END AS bottleneck,
+    COUNT(*) AS cnt, AVG(total_login_time_ms) AS avg_ms
+FROM xe.login_timers
+WHERE case_id = '{case_id}' AND is_success = 1 AND total_login_time_ms > 100
+GROUP BY CASE
+    WHEN sspi_processing_ms > total_login_time_ms * 0.5 THEN 'SSPI/AD Auth'
+    WHEN ssl_processing_ms > total_login_time_ms * 0.5 THEN 'SSL/TLS'
+    WHEN network_reads_ms > total_login_time_ms * 0.5 THEN 'Network Read'
+    WHEN login_task_enqueued_ms > total_login_time_ms * 0.5 THEN 'Thread Starvation'
+    WHEN fedauth_processing_ms > total_login_time_ms * 0.5 THEN 'FedAuth/AAD'
+    ELSE 'Mixed/Other'
+END ORDER BY cnt DESC
 ```
 
 **Ad-hoc: shred any event from raw XML** (example — `security_error_ring_buffer_recorded`):
@@ -300,7 +381,7 @@ GROUP BY CAST(event_time AS DATE), DATEPART(HOUR, event_time) ORDER BY day, hr
 
 **Look for:** Non-yielding events with low CPU → thread stuck (I/O, memory grant, latch), not CPU starvation.
 
-#### 2.5 xe.connectivity — Connection Errors
+#### 2.5 xe.connectivity — Connection Errors + Login Timers
 
 ```sql
 -- Error pattern
@@ -313,7 +394,35 @@ SELECT remote_host, COUNT(*) AS cnt,
        MIN(event_time) AS first_seen, MAX(event_time) AS last_seen
 FROM xe.connectivity WHERE case_id = '{case_id}' AND sni_consumer_error > 0
 GROUP BY remote_host ORDER BY cnt DESC
+
+-- Slow login analysis (full timer breakdown)
+SELECT TOP 20
+    event_time, total_login_time_ms,
+    login_task_enqueued_ms AS enqueue, network_reads_ms AS net_read,
+    ssl_processing_ms AS ssl, ssl_secure_calls_ms AS ssl_api,
+    sspi_processing_ms AS sspi, sspi_secure_calls_ms AS sspi_api,
+    find_login_ms, logon_triggers_ms, remote_host
+FROM xe.connectivity
+WHERE case_id = '{case_id}' AND total_login_time_ms > 100
+ORDER BY total_login_time_ms DESC
 ```
+
+**Login Timer Interpretation:**
+
+| Field | High value indicates |
+|-------|---------------------|
+| `login_task_enqueued_ms` | SQL Server thread starvation (no worker threads) |
+| `network_reads_ms` | Network latency or client not responding |
+| `ssl_processing_ms` | TLS issues (cert chain, CRL check) |
+| `ssl_secure_calls_ms` | SSL API slow |
+| `sspi_processing_ms` | **AD/Kerberos/NTLM slow** |
+| `sspi_secure_calls_ms` | **Domain controller slow/unreachable** |
+| `find_login_ms` | Login validation slow |
+| `logon_triggers_ms` | Logon trigger overhead |
+| `exec_classifier_ms` | Resource Governor classifier slow |
+
+**Note:** `connectivity_ring_buffer_recorded` only fires on connection failure/abnormal close.
+For **successful login timing**, need `process_login_finish` from custom XEvent session → `xe.login_timers`.
 
 **Look for:**
 - `os_error = 10054` (connection reset by peer) → network/client issue

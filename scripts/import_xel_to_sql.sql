@@ -127,26 +127,49 @@ CREATE TABLE xe.deadlocks (
 
 IF OBJECT_ID('xe.connectivity') IS NOT NULL DROP TABLE xe.connectivity;
 CREATE TABLE xe.connectivity (
-    id                  INT IDENTITY PRIMARY KEY,
-    case_id             NVARCHAR(50) NOT NULL,
-    raw_id              INT NOT NULL,
-    event_time          DATETIME2(3) NOT NULL,
-    conn_type           NVARCHAR(50),
-    source_text         NVARCHAR(50),
-    os_error            BIGINT,
-    sni_error           BIGINT,
-    sni_consumer_error  BIGINT,
-    sni_provider        INT,
-    state               INT,
-    session_id          INT,
-    local_port          INT,
-    remote_port         INT,
-    local_host          NVARCHAR(50),
-    remote_host         NVARCHAR(50),
-    tds_flags           NVARCHAR(200),
-    total_login_time_ms INT,
-    sspi_processing_ms  INT,
-    ssl_processing_ms   INT,
+    id                      INT IDENTITY PRIMARY KEY,
+    case_id                 NVARCHAR(50) NOT NULL,
+    raw_id                  INT NOT NULL,
+    event_time              DATETIME2(3) NOT NULL,
+    conn_type               NVARCHAR(50),
+    source_text             NVARCHAR(50),
+    os_error                BIGINT,
+    sni_error               BIGINT,
+    sni_consumer_error      BIGINT,
+    sni_provider            INT,
+    state                   INT,
+    session_id              INT,
+    local_port              INT,
+    remote_port             INT,
+    local_host              NVARCHAR(50),
+    remote_host             NVARCHAR(50),
+    tds_flags               NVARCHAR(200),
+    -- Login Timer: Top-level
+    total_login_time_ms     INT,
+    login_task_enqueued_ms  INT,
+    network_writes_ms       INT,
+    network_reads_ms        INT,
+    -- Login Timer: SSL breakdown
+    ssl_processing_ms       INT,
+    ssl_net_reads_ms        INT,
+    ssl_net_writes_ms       INT,
+    ssl_secure_calls_ms     INT,
+    ssl_enqueue_ms          INT,
+    -- Login Timer: SSPI breakdown (AD/Windows auth)
+    sspi_processing_ms      INT,
+    sspi_net_reads_ms       INT,
+    sspi_net_writes_ms      INT,
+    sspi_secure_calls_ms    INT,
+    sspi_enqueue_ms         INT,
+    -- Login Timer: Server-side processing
+    login_trigger_and_rg_ms INT,
+    find_login_ms           INT,
+    logon_triggers_ms       INT,
+    exec_classifier_ms      INT,
+    session_recover_ms      INT,
+    -- Connection metadata
+    connection_id           NVARCHAR(100),
+    connection_peer_id      NVARCHAR(100),
     INDEX ix_time    (event_time),
     INDEX ix_sni_err (sni_consumer_error),
     INDEX ix_os_err  (os_error),
@@ -181,6 +204,63 @@ CREATE TABLE xe.memory_broker (
     current_target_kb BIGINT,
     INDEX ix_time   (event_time),
     INDEX ix_broker (broker_type)
+);
+
+-- process_login_finish: captures ALL logins (success+failure) with full timer breakdown
+-- Source: custom XEvent session (NOT system_health). Import only if events exist in raw_events.
+IF OBJECT_ID('xe.login_timers') IS NOT NULL DROP TABLE xe.login_timers;
+CREATE TABLE xe.login_timers (
+    id                              INT IDENTITY PRIMARY KEY,
+    case_id                         NVARCHAR(50) NOT NULL,
+    raw_id                          INT NOT NULL,
+    event_time                      DATETIME2(3) NOT NULL,
+    is_success                      BIT,
+    error                           INT,
+    spid                            INT,
+    session_id                      INT,
+    -- Login Timer: Top-level
+    total_login_time_ms             INT,
+    login_task_enqueued_ms          INT,
+    network_writes_ms               INT,
+    network_reads_ms                INT,
+    -- Login Timer: SSL breakdown
+    ssl_processing_ms               INT,
+    ssl_net_reads_ms                INT,
+    ssl_net_writes_ms               INT,
+    ssl_secure_calls_ms             INT,
+    ssl_enqueue_ms                  INT,
+    -- Login Timer: SSPI breakdown (AD/Windows auth)
+    sspi_processing_ms              INT,
+    sspi_net_reads_ms               INT,
+    sspi_net_writes_ms              INT,
+    sspi_secure_calls_ms            INT,
+    sspi_enqueue_ms                 INT,
+    -- Login Timer: Server-side processing
+    login_trigger_and_rg_ms         INT,
+    find_login_ms                   INT,
+    logon_triggers_ms               INT,
+    exec_classifier_ms              INT,
+    session_recover_ms              INT,
+    -- Login Timer: FedAuth / Azure AD
+    fedauth_processing_ms           INT,
+    fedauth_net_reads_ms            INT,
+    fedauth_net_writes_ms           INT,
+    fedauth_secure_calls_ms         INT,
+    fedauth_enqueue_ms              INT,
+    fedauth_aad_processing_ms       INT,
+    fedauth_aad_retry_count         INT,
+    -- Login Timer: Misc
+    contained_auth_ms               INT,
+    db_firewall_rules_ms            INT,
+    dosguard_check_ms               INT,
+    -- Connection metadata
+    application_name                NVARCHAR(256),
+    driver_name                     NVARCHAR(256),
+    client_hostname                 NVARCHAR(128),
+    connection_id                   NVARCHAR(100),
+    INDEX ix_time    (event_time),
+    INDEX ix_success (is_success),
+    INDEX ix_total   (total_login_time_ms)
 );
 
 PRINT CONCAT('Tables ready. (', DATEDIFF(ms, @t0, SYSDATETIME()), ' ms)');
@@ -316,8 +396,12 @@ PRINT '== Step 7: connectivity ==';
 INSERT INTO xe.connectivity (
     case_id, raw_id, event_time, conn_type, source_text,
     os_error, sni_error, sni_consumer_error, sni_provider, state, session_id,
-    local_port, remote_port, local_host, remote_host,
-    tds_flags, total_login_time_ms, sspi_processing_ms, ssl_processing_ms)
+    local_port, remote_port, local_host, remote_host, tds_flags,
+    total_login_time_ms, login_task_enqueued_ms, network_writes_ms, network_reads_ms,
+    ssl_processing_ms, ssl_net_reads_ms, ssl_net_writes_ms, ssl_secure_calls_ms, ssl_enqueue_ms,
+    sspi_processing_ms, sspi_net_reads_ms, sspi_net_writes_ms, sspi_secure_calls_ms, sspi_enqueue_ms,
+    login_trigger_and_rg_ms, find_login_ms, logon_triggers_ms, exec_classifier_ms, session_recover_ms,
+    connection_id, connection_peer_id)
 SELECT N'$(case_id)', id, event_time,
     event_data.value('(event/data[@name="type"]/text)[1]', 'nvarchar(50)'),
     event_data.value('(event/data[@name="source"]/text)[1]', 'nvarchar(50)'),
@@ -332,9 +416,32 @@ SELECT N'$(case_id)', id, event_time,
     event_data.value('(event/data[@name="local_host"]/value)[1]', 'nvarchar(50)'),
     event_data.value('(event/data[@name="remote_host"]/value)[1]', 'nvarchar(50)'),
     event_data.value('(event/data[@name="tds_flags"]/text)[1]', 'nvarchar(200)'),
+    -- Top-level login timers
     event_data.value('(event/data[@name="total_login_time_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="login_task_enqueued_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="network_writes_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="network_reads_ms"]/value)[1]', 'int'),
+    -- SSL breakdown
+    event_data.value('(event/data[@name="ssl_processing_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="ssl_net_reads_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="ssl_net_writes_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="ssl_secure_calls_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="ssl_enqueue_ms"]/value)[1]', 'int'),
+    -- SSPI breakdown
     event_data.value('(event/data[@name="sspi_processing_ms"]/value)[1]', 'int'),
-    event_data.value('(event/data[@name="ssl_processing_ms"]/value)[1]', 'int')
+    event_data.value('(event/data[@name="sspi_net_reads_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="sspi_net_writes_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="sspi_secure_calls_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="sspi_enqueue_ms"]/value)[1]', 'int'),
+    -- Server-side processing
+    event_data.value('(event/data[@name="login_trigger_and_resource_governor_processing_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="find_login_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="logon_triggers_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="exec_classifier_ms"]/value)[1]', 'int'),
+    event_data.value('(event/data[@name="session_recover_ms"]/value)[1]', 'int'),
+    -- Connection metadata
+    event_data.value('(event/data[@name="connection_id"]/value)[1]', 'nvarchar(100)'),
+    event_data.value('(event/data[@name="connection_peer_id"]/value)[1]', 'nvarchar(100)')
 FROM xe.raw_events WHERE case_id = N'$(case_id)' AND event_name = 'connectivity_ring_buffer_recorded';
 
 PRINT CONCAT('  Rows: ', @@ROWCOUNT, ' (', DATEDIFF(ms, @step_start, SYSDATETIME()), ' ms)');
@@ -373,6 +480,78 @@ FROM xe.raw_events WHERE case_id = N'$(case_id)' AND event_name = 'memory_broker
 PRINT CONCAT('  Rows: ', @@ROWCOUNT, ' (', DATEDIFF(ms, @step_start, SYSDATETIME()), ' ms)');
 
 -- =====================================================================
+-- Step 10: process_login_finish (custom XEvent session, not system_health)
+-- Captures ALL logins (success + failure) with full timer breakdown.
+-- Only imports if events exist in raw_events.
+-- =====================================================================
+SET @step_start = SYSDATETIME();
+PRINT '== Step 10: process_login_finish ==';
+
+IF EXISTS (SELECT 1 FROM xe.raw_events WHERE case_id = N'$(case_id)' AND event_name = 'process_login_finish')
+BEGIN
+    INSERT INTO xe.login_timers (
+        case_id, raw_id, event_time, is_success, error, spid, session_id,
+        total_login_time_ms, login_task_enqueued_ms, network_writes_ms, network_reads_ms,
+        ssl_processing_ms, ssl_net_reads_ms, ssl_net_writes_ms, ssl_secure_calls_ms, ssl_enqueue_ms,
+        sspi_processing_ms, sspi_net_reads_ms, sspi_net_writes_ms, sspi_secure_calls_ms, sspi_enqueue_ms,
+        login_trigger_and_rg_ms, find_login_ms, logon_triggers_ms, exec_classifier_ms, session_recover_ms,
+        fedauth_processing_ms, fedauth_net_reads_ms, fedauth_net_writes_ms, fedauth_secure_calls_ms,
+        fedauth_enqueue_ms, fedauth_aad_processing_ms, fedauth_aad_retry_count,
+        contained_auth_ms, db_firewall_rules_ms, dosguard_check_ms,
+        application_name, driver_name, client_hostname, connection_id)
+    SELECT N'$(case_id)', id, event_time,
+        event_data.value('(event/data[@name="is_success"]/value)[1]', 'bit'),
+        event_data.value('(event/data[@name="error"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="spid"]/value)[1]', 'int'),
+        event_data.value('(event/action[@name="session_id"]/value)[1]', 'int'),
+        -- Top-level login timers
+        event_data.value('(event/data[@name="total_time_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="enqueue_time_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="netwrite_time_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="netread_time_ms"]/value)[1]', 'int'),
+        -- SSL breakdown
+        event_data.value('(event/data[@name="ssl_time_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="ssl_net_reads_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="ssl_net_writes_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="ssl_secure_call_time_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="ssl_enqueue_ms"]/value)[1]', 'int'),
+        -- SSPI breakdown
+        event_data.value('(event/data[@name="sspi_time_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="sspi_net_reads_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="sspi_net_writes_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="sspi_secure_call_time_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="sspi_enqueue_ms"]/value)[1]', 'int'),
+        -- Server-side processing
+        event_data.value('(event/data[@name="login_trigger_and_resource_governor_processing_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="find_login_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="logon_triggers_time_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="exec_classifier_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="session_recover_ms"]/value)[1]', 'int'),
+        -- FedAuth / Azure AD
+        event_data.value('(event/data[@name="fedauth_processing_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="fedauth_net_reads_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="fedauth_net_writes_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="fedauth_secure_calls_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="fedauth_enqueue_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="fedauth_aad_processing_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="fedauth_aad_retry_count"]/value)[1]', 'int'),
+        -- Misc
+        event_data.value('(event/data[@name="contained_authentication_time_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="database_firewall_rules_time_ms"]/value)[1]', 'int'),
+        event_data.value('(event/data[@name="dosguard_check_time_ms"]/value)[1]', 'int'),
+        -- Connection metadata
+        event_data.value('(event/action[@name="client_app_name"]/value)[1]', 'nvarchar(256)'),
+        event_data.value('(event/data[@name="driver_name"]/value)[1]', 'nvarchar(256)'),
+        event_data.value('(event/action[@name="client_hostname"]/value)[1]', 'nvarchar(128)'),
+        event_data.value('(event/data[@name="connection_id"]/value)[1]', 'nvarchar(100)')
+    FROM xe.raw_events WHERE case_id = N'$(case_id)' AND event_name = 'process_login_finish';
+
+    PRINT CONCAT('  Rows: ', @@ROWCOUNT, ' (', DATEDIFF(ms, @step_start, SYSDATETIME()), ' ms)');
+END
+ELSE
+    PRINT '  Skipped (no process_login_finish events in raw_events)';
+
+-- =====================================================================
 -- Summary
 -- =====================================================================
 DECLARE @elapsed_ms INT = DATEDIFF(ms, @t0, SYSDATETIME());
@@ -380,7 +559,7 @@ PRINT '';
 PRINT '========================================';
 PRINT '  Import Complete — ' + N'$(case_id)';
 PRINT '========================================';
-DECLARE @c1 INT, @c2 INT, @c3 INT, @c4 INT, @c5 INT, @c6 INT, @c7 INT, @c8 INT, @c9 INT;
+DECLARE @c1 INT, @c2 INT, @c3 INT, @c4 INT, @c5 INT, @c6 INT, @c7 INT, @c8 INT, @c9 INT, @c10 INT;
 SELECT @c1 = COUNT(*) FROM xe.raw_events    WHERE case_id = N'$(case_id)';
 SELECT @c2 = COUNT(*) FROM xe.errors        WHERE case_id = N'$(case_id)';
 SELECT @c3 = COUNT(*) FROM xe.waits         WHERE case_id = N'$(case_id)';
@@ -390,6 +569,7 @@ SELECT @c6 = COUNT(*) FROM xe.deadlocks     WHERE case_id = N'$(case_id)';
 SELECT @c7 = COUNT(*) FROM xe.connectivity  WHERE case_id = N'$(case_id)';
 SELECT @c8 = COUNT(*) FROM xe.security_errors WHERE case_id = N'$(case_id)';
 SELECT @c9 = COUNT(*) FROM xe.memory_broker WHERE case_id = N'$(case_id)';
+SELECT @c10 = COUNT(*) FROM xe.login_timers WHERE case_id = N'$(case_id)';
 PRINT CONCAT('  Raw events:      ', @c1);
 PRINT CONCAT('  Errors:          ', @c2);
 PRINT CONCAT('  Waits:           ', @c3);
@@ -399,6 +579,7 @@ PRINT CONCAT('  Deadlocks:       ', @c6);
 PRINT CONCAT('  Connectivity:    ', @c7);
 PRINT CONCAT('  Security errors: ', @c8);
 PRINT CONCAT('  Memory broker:   ', @c9);
+PRINT CONCAT('  Login timers:    ', @c10);
 PRINT '';
 PRINT CONCAT('  Total elapsed: ', @elapsed_ms / 1000, '.', RIGHT('000' + CAST(@elapsed_ms % 1000 AS VARCHAR), 3), ' s');
 GO
