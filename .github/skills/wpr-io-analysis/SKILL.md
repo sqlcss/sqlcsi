@@ -79,7 +79,7 @@ Every query follows this pattern:
 | Disk | `Disk` | UInt32 | physical disk number |
 | Bytes | `Size` | Bytes | bytes transferred — **Sum** for throughput |
 | Per-I/O latency | `Disk_Service_Time` | TimestampDelta | ⭐ **Average / Max / Sum** — the latency metric |
-| Storport latency | `Storport_Disk_Service_Time` | TimestampDelta | hardware-side latency (check `Is_Storport_Duration_Reliable`) |
+| Storport latency | `Storport_Disk_Service_Time` | TimestampDelta | hardware-side latency (check `Is_Storport_Duration_Reliable`). In WPA GUI: right-click column header → More Columns → scroll to find it (may be hidden by default) |
 | I/O outstanding time | `IO_Time` | TimestampDelta | total time the I/O was outstanding |
 | Count | `Count` | Int32 | number of I/O operations — **Sum** |
 | Thread | `Thread_ID` | Int32 | issuing thread |
