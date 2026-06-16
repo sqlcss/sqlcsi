@@ -1,7 +1,7 @@
 WPR Trace Analysis Skills — Setup Guide
 ========================================
 
-These skills (wpr-cpu-analysis, wpr-allocation-analysis, wpr-cpu-comparison)
+These skills (wpr-cpu-analysis, wpr-cpu-comparison, wpr-io-analysis, wpr-allocation-analysis)
 require the WPA MCP server to query ETL trace data. Follow these steps to set up.
 
 1. Install WPA (Windows Performance Analyzer)
@@ -68,16 +68,22 @@ wpr-cpu-analysis:
   - Uses "CPU Usage (Sampled)" table — requires CPU sampling providers
   - Symbols must be loaded for Function/Stack resolution
 
-wpr-allocation-analysis:
-  - Uses diag-perf MCP server (separate from WPA MCP)
-  - Requires GC AllocationTick events in the trace
-  - CPU-only traces will have no allocation data
-
 wpr-cpu-comparison:
   - Compares two ETL traces (baseline vs problem)
   - Uses WPA MCP mirror query pattern (queries each trace independently)
   - Both ETL files must be opened in WPA simultaneously
   - Method 1 (Thread-scoped) or Method 2 (Process-level) based on thread distribution
+
+wpr-io-analysis:
+  - Uses "Disk Usage" and "File I/O" tables — requires storage/disk I/O providers
+  - Per-file/database aggregation, latency distribution, by-process/thread breakdown
+  - Symbols not required for I/O analysis
+  - Focus on slow I/O, PAGEIOLATCH/WRITELOG waits, offset/size cross-check
+
+wpr-allocation-analysis:
+  - Uses diag-perf MCP server (separate from WPA MCP)
+  - Requires GC AllocationTick events in the trace
+  - CPU-only traces will have no allocation data
 
 5. Troubleshooting
 -------------------
