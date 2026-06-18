@@ -117,6 +117,17 @@
       "type": "stdio",
       "command": "C:\\Users\\lduan\\AppData\\Local\\Microsoft\\WindowsApps\\Microsoft.WindowsPerformanceAnalyzerInternal_g4ype1skzj3jy\\wpa-mcp.exe",
       "args": ["1"]
+    },
+    "tavily": {
+      "type": "local",
+      "command": "npx",
+      "args": [
+        "-y",
+        "tavily-mcp@latest"
+      ],
+      "tools": [
+        "*"
+      ]
     }
   }
 }

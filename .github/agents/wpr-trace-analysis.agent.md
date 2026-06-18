@@ -2,51 +2,39 @@
 name: wpr-trace-analysis
 description: >-
   Analyze Windows Performance Recorder (WPR) ETL traces for SQL Server processes.
-  Uses WPA MCP server for CPU profiling, call stack analysis, and module breakdown.
-  Focuses on sqlservr.exe. Use when the user says "analyze WPR trace", "analyze ETL",
-  "CPU profiling", "分析 WPR", or provides .etl file paths.
-tools: [execute, read, edit, search, agent, todo, web, wpa/*]
+  Uses diag-perf MCP server tools for CPU profiling, call stack analysis, and module
+  breakdown. Focuses on sqlservr.exe. Use when the user says "analyze WPR trace",
+  "analyze ETL", "CPU profiling", "分析 WPR", or provides .etl file paths.
+tools: [execute, read, edit, search, agent, todo, web, diag-perf/*]
 agents: [docs-lookup, source-search]
 ---
 
 # WPR Trace Analysis Agent
 
-Entry point for WPR/ETL trace analysis. Handles prerequisites, gathers inputs,
-then routes to the appropriate skill for analysis.
+Analyze Windows Performance Recorder (WPR) `.etl` traces focused on SQL Server
+(`sqlservr.exe`). Uses the `diag-perf` MCP server for trace parsing and CPU profiling,
+then applies SQL Server domain knowledge to interpret results.
 
-## Skill Registry
+## When to Use
 
-| Skill | Status | Purpose | Path |
-|-------|--------|---------|------|
-| `wpr-cpu-analysis` | ✅ | CPU hotspot investigation (Broad→Narrow 4-method workflow) | [skills/wpr-cpu-analysis/SKILL.md](../skills/wpr-cpu-analysis/SKILL.md) |
-| `wpr-cpu-comparison` | ✅ | CPU baseline vs problem trace comparison (Method 1/2) | [skills/wpr-cpu-comparison/SKILL.md](../skills/wpr-cpu-comparison/SKILL.md) |
-| `wpr-io-analysis` | ✅ | Disk/File I/O investigation (per-file/database aggregation, latency, by process/thread) | [skills/wpr-io-analysis/SKILL.md](../skills/wpr-io-analysis/SKILL.md) |
-| `wpr-allocation-analysis` | 🚧 planned | Allocation analysis (top types, call stacks) — uses diag-perf MCP, not yet migrated to WPA MCP | — |
+- Non-yielding scheduler investigation — what was SQL Server doing when it couldn't yield
+- High CPU on SQL Server — which modules/functions are hot
+- CPU comparison — baseline vs problem trace
+- General WPR trace triage for SQL Server processes
 
-## WPA MCP Tools Reference
+## diag-perf MCP Tools Reference
 
 | Tool | Purpose |
 |------|---------|
-| `list_traces` | List loaded traces and available tables |
-| `get_schema` | Get table schema (fields, filters, aggregations) |
-| `start_new_query` | Start a new query on a table |
-| `add_condition` | Add filter condition |
-| `add_grouping` | Add group-by field |
-| `add_aggregation` | Add aggregation (Sum, Count, Average, Min, Max) |
-| `perform_query` | Execute the query |
-| `cancel_query` | Cancel a running query |
+| `perf_open_trace` | Open an ETL file for analysis |
+| `perf_get_processes` | List all processes in the trace |
+| `perf_close_trace` | Close trace when done |
+| `cpu_get_grouped_stacks` | CPU samples grouped by module / namespace / pattern |
+| `cpu_get_frame_info` | Detailed CPU metrics for a specific function |
+| `cpu_get_stack_info` | Callers / callees of a specific function |
+| `cpu_compare_traces` | Compare baseline vs candidate traces |
 
-### WPA MCP Gotchas
-
-| Field | Type | Sum aggregation |
-|-------|------|-----------------|
-| `Weight` | TimestampDelta | ✅ works — **always use this** |
-| `__Weight` | Double | ❌ returns 0 (MCP bug) |
-| `Count` | Int | ✅ Sum & Count both work |
-
-## Step 0 — Prerequisites
-
-### Symbol Configuration
+## Step 0 — Configure Private Symbol Path
 
 Private symbols are **required** for meaningful SQL Server CPU profiling (without them
 all functions show as `module!?`).
@@ -65,48 +53,212 @@ all functions show as `module!?`).
 - `https://symweb.azurefd.net` — Microsoft internal symbol server (private symbols)
 - Public fallback: `https://msdl.microsoft.com/download/symbols`
 
-### WPA Setup
+After setting, **restart the diag-perf MCP server** (Ctrl+Shift+P → "MCP: Restart
+Server" → diag-perf). The server reads env vars at startup only.
 
-User must:
-1. Open the ETL file in **WPA GUI**
-2. Filter to the target process (e.g. `sqlservr.exe`) in CPU Usage (Sampled) view
-3. **Load Symbols** (Trace → Load Symbols 或 Ctrl+Shift+S)
-   — filtering first avoids downloading unrelated PDBs, much faster
-4. WPA MCP server must be running (check via `list_traces`)
+**Note:** First analysis will be slower — PDBs download on first use (~50-200 MB per DLL).
+Subsequent runs use the local cache.
 
-## Step 1 — Gather Inputs & Route
+## Step 1 — Gather Inputs
 
 Ask the user for:
 
-1. **investigation_type** — What type of investigation?
+1. **etl_path** — Path to the `.etl` file (required).
+2. **investigation_type** — What type of investigation?
    - **CPU 分析** — CPU hotspot analysis（high CPU, non-yielding, spinlock）
    - **CPU 对比** — Compare baseline vs problem trace（需要两个 ETL）
-   - **IO 分析** — Disk/File I/O investigation（慢 IO、PAGEIOLATCH/WRITELOG、按文件聚合）
-   If not specified, ask: **"这是什么类型的调查？CPU 分析 / CPU 对比 / IO 分析？"**
-
-2. **case_id** (optional) — Link to an existing case investigation.
+   - **GC 分析** — GC pauses, throughput, memory pressure
+   - **Allocation 分析** — 哪些类型分配最多内存
+   If not specified, ask: **"这是什么类型的调查？CPU / CPU 对比 / GC / Allocation？"**
+3. **case_id** (optional) — Link to an existing case investigation.
    If provided, cross-reference with existing ERRORLOG/XEvent findings in `reports/`.
 
-### Route to Skill
+### Investigation Routing
 
-| investigation_type | Read skill, then execute |
-|-------------------|--------------------------|
-| **CPU 分析** | Read [wpr-cpu-analysis/SKILL.md](../skills/wpr-cpu-analysis/SKILL.md), execute Phase 1→9 |
-| **CPU 对比** | Read [wpr-cpu-comparison/SKILL.md](../skills/wpr-cpu-comparison/SKILL.md), execute Phase 0 → Method Selection → Phase 2→3 → Phase 4→7 |
-| **IO 分析** | Read [wpr-io-analysis/SKILL.md](../skills/wpr-io-analysis/SKILL.md), execute Phase 1→7 |
-
-**IMPORTANT**: Read the ENTIRE skill file before starting execution. The skill contains
-the complete methodology, query patterns, SQL Server interpretation tables, and output
-format. Follow it step by step.
+| investigation_type | Workflow |
+|-------------------|----------|
+| CPU 分析 | Step 2 → Step 3 → Step 4 → Step 5 → Step 7 → Step 8 |
+| CPU 对比 | Step 2 (both traces) → Step 6 → Step 8 |
+| GC 分析 | Step 2 → use `gc_analyze_process`, `gc_get_stats`, `gc_get_longest_pauses`, `gc_get_performance_issues` |
+| Allocation 分析 | Step 2 → use `allocation_get_top_types`, `allocation_get_stacks_for_type` |
 
 For CPU 分析, optionally ask for **sub-focus**:
 - "non-yielding" — focus on scheduler stalls, spinlocks
 - "high CPU" — general hotspot analysis (default)
 
+
+## Step 2 — Open Trace & Identify SQL Server Process
+
+```
+Call perf_open_trace(filePath = "{etl_path}")
+```
+
+Review validation output for warnings (lost events, circular buffer overflow).
+
+```
+Call perf_get_processes(filePath = "{etl_path}")
+```
+
+**Find `sqlservr.exe`** in the process list. If multiple instances exist, ask user
+which PID to analyze. Record the PID for all subsequent calls.
+
+If `sqlservr.exe` is not found, list the top 5 CPU-consuming processes and ask the
+user which one to analyze.
+
+## Step 3 — Module-Level CPU Overview
+
+```
+Call cpu_get_grouped_stacks(
+    filePath = "{etl_path}",
+    processId = {pid},
+    groupBy = "module",
+    maxGroups = 15
+)
+```
+
+**Present the top modules** and classify them into SQL Server subsystem categories:
+
+| Module pattern | SQL Server subsystem |
+|----------------|---------------------|
+| `sqldk.dll` | SQL OS (scheduler, memory, task management) |
+| `sqllang.dll` | Query processing, compilation, execution |
+| `sqlmin.dll` | Storage engine, buffer pool, lock manager |
+| `sqltses.dll` | T-SQL execution, expression evaluation |
+| `sqlaccess.dll` | Access methods (B-tree, heap, LOB) |
+| `qds.dll` | Query Store |
+| `hkengine.dll`, `hkruntime.dll` | In-Memory OLTP (Hekaton) |
+| `hadrres.dll`, `hadrdbmgr.dll` | Always On / HADR |
+| `xesqlpkg.dll`, `xesospkg.dll` | XEvent |
+| `ntoskrnl.exe` | Windows kernel (context switches, syscalls) |
+| `ntdll.dll` | NT runtime (heap, locks) |
+| `clr.dll`, `coreclr.dll` | CLR / SQLCLR |
+
+Show a summary table:
+```
+Module           CPU %   Subsystem
+sqlmin.dll       34.2%   Storage Engine
+sqllang.dll      28.1%   Query Processing
+sqldk.dll        15.3%   SQL OS
+ntoskrnl.exe      8.7%   Windows Kernel
+...
+```
+
+## Step 4 — Function-Level Deep Dive
+
+For the top 3 hottest modules, drill into function-level detail:
+
+```
+Call cpu_get_grouped_stacks(
+    filePath = "{etl_path}",
+    processId = {pid},
+    groupBy = "namespace",
+    includeFilter = "<hot_module>",
+    maxGroups = 15
+)
+```
+
+For the top 3-5 hottest functions overall:
+
+```
+Call cpu_get_frame_info(
+    filePath = "{etl_path}",
+    processId = {pid},
+    frameName = "<hot_function>"
+)
+```
+
+Then trace call chains:
+
+```
+Call cpu_get_stack_info(
+    filePath = "{etl_path}",
+    processId = {pid},
+    frameName = "<hot_function>",
+    maxCallers = 10,
+    maxCallees = 10
+)
+```
+
+## Step 5 — SQL Server–Specific Interpretation
+
+Map hot functions to known SQL Server patterns:
+
+| Hot function pattern | Likely cause |
+|---------------------|-------------|
+| `SOS_Scheduler::*Yield*`, `SOS_Task::*` | Scheduler contention / non-yielding |
+| `BPool::Get`, `BPool::*Lazy*` | Buffer pool pressure, lazy writer active |
+| `LockManager::*`, `lck_*` | Lock contention |
+| `IndexPageManager::*`, `BTreeRow::*` | Index scan/seek heavy workload |
+| `CMsqlExecContext::Execute*` | Query execution (check for plan issues) |
+| `CAutoSMemGlobalHeap::*`, `MemoryClerk*` | Memory pressure |
+| `LogWriter::*`, `CLogMgr::*` | Transaction log bottleneck |
+| `HaDbMgr::*`, `HadrArProxy::*` | AG / HADR operations |
+| `XeSosPkg::*`, `XeSqlPkg::*` | XEvent overhead |
+| `SpinlockBase::*`, `SOS_SPIN_LOCK::*` | Spinlock contention |
+
+### Non-Yielding Focus
+
+If `investigation_focus == "non-yielding"`:
+1. Look for functions that run for extended time without calling `SwitchContext` or `Yield`
+2. Check for spinlock spins (`SpinlockBase::Backoff`, `SpinlockBase::SpinToAcquire`)
+3. Check for long hash/sort operations in `sqllang!CQScanHash*`, `sqllang!CQScanSort*`
+4. Check for compilation storms (`sqllang!CCompPlan*`, `sqllang!COptExpr*`)
+5. Map findings to the specific scheduler/SPID from ERRORLOG if `case_id` is linked
+
+## Step 6 — CPU Comparison (if requested)
+
+If `investigation_focus == "compare"` and user provides a baseline trace:
+
+```
+Call cpu_compare_traces(
+    baseline = "{baseline_etl}",
+    comparison = "{problem_etl}",
+    baselinePid = {baseline_pid},
+    comparisonPid = {problem_pid}
+)
+```
+
+Present regression analysis: which functions/modules increased significantly.
+
+## Step 7 — Cross-Reference with Existing Analysis
+
+If `case_id` is provided, check for existing analysis:
+
+```powershell
+$findings = Get-ChildItem "reports/{case_id}_*" -ErrorAction SilentlyContinue
+```
+
+If ERRORLOG findings exist (`{case_id}_errorlog_findings.json`):
+- Correlate non-yielding timestamps with CPU hotspots
+- Match dump triggers (latch timeout, non-yielding) with trace time windows
+
+If XEvent findings exist:
+- Correlate wait type patterns with CPU profile
+- Match scheduler pressure events with CPU distributions
+
+## Step 8 — Close Trace & Generate Report
+
+```
+Call perf_close_trace(filePath = "{etl_path}")
+```
+
+Before generating the report, ask the user for preferred **language** (English or 中文)
+and **format** (HTML or Markdown).
+
+Report includes:
+1. **Executive Summary** — Top finding in ≤3 sentences
+2. **Module Breakdown** — Table with CPU % per SQL Server subsystem
+3. **Top Functions** — Hottest functions with call stack context
+4. **SQL Server Interpretation** — Domain-specific analysis of what the CPU profile means
+5. **Cross-Reference** — Correlations with ERRORLOG/XEvent (if available)
+6. **Recommendations** — Actionable next steps
+
+Save to: `reports/{case_id}_wpr_analysis.{html|md}`
+
 ## Error Handling
 
-If any WPA MCP tool call fails, stop and return the error verbatim.
+If any `diag-perf` MCP tool call fails, stop and return the error verbatim.
 Do NOT retry silently. Common issues:
-- No traces loaded → ask user to open ETL in WPA
-- All functions show as `?` → ask user to Load Symbols in WPA
-- Query returns empty → check Process filter value matches exactly
+- ETL file too large / corrupted → report and suggest re-collecting
+- Lost events warning → note in report but continue analysis
+- sqlservr.exe not found → list available processes and ask user

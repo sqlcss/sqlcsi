@@ -136,8 +136,92 @@ sqlcsi/
 - **PowerShell** with `SqlServer` module (auto-installed on first XEL extraction)
 - **MCP servers** configured in [.vscode/mcp.json](.vscode/mcp.json):
   - `microsoft-learn` — for `docs-lookup`
-  - `msdata` / `csswiki` — for `source-search`
-  - Optional: `mssql`, `bluebird-mcp-*`, `azure-mcp`, `enghub`, `icm-prod`, `SqlOps`
+  - `msdata` / `csswiki` — for `source-search` and CSS Wiki TSG lookup
+  - `tavily` — for `docs-lookup` web search (see [Tavily Setup](#tavily-web-search-mcp-setup) below)
+  - `bluebird-mcp-*` — engine source code search per release branch: `bluebird-mcp-sql` (master), `bluebird-mcp-2025`, `bluebird-mcp-2022`, `bluebird-mcp-2019`, `bluebird-mcp-2017`, `bluebird-mcp-2016`
+  - `diag-perf` / `wpa` — for WPR/ETL trace analysis (`wpr-trace-analysis`)
+  - Optional: `mssql`, `enghub`, `azure-mcp`, `SqlOps`, `icm-prod`
+
+## Tavily Web Search MCP Setup
+
+The `docs-lookup` agent uses Tavily for public web search. Follow these steps to set it up.
+
+### 1. Register a Tavily account (free)
+
+1. Go to **https://app.tavily.com/sign-in**
+2. Click **Sign up** — you can use a Google account or email
+3. **No credit card required**
+
+### 2. Get your free API Key
+
+1. After login, go to Dashboard: **https://app.tavily.com/home**
+2. Your **API Key** is displayed on the page (format: `tvly-dev-xxxx...`)
+3. Copy the key
+
+**Free quota:** 1,000 search requests per month.
+
+### 3. Set the Windows environment variable
+
+Open PowerShell and run:
+
+```powershell
+[System.Environment]::SetEnvironmentVariable("TAVILY_API_KEY", "tvly-dev-your-key-here", "User")
+```
+
+Verify:
+
+```powershell
+[System.Environment]::GetEnvironmentVariable("TAVILY_API_KEY", "User")
+```
+
+> ⚠️ Restart your terminal/application after setting the variable.
+
+### 4. Configure MCP
+
+#### Copilot CLI (`~/.copilot/mcp-config.json`)
+
+Add to the `mcpServers` section:
+
+```json
+"tavily": {
+  "type": "local",
+  "command": "npx",
+  "args": ["-y", "tavily-mcp@latest"],
+  "tools": ["*"]
+}
+```
+
+No need to put the API key in the config — the npx process inherits `TAVILY_API_KEY` from the system environment automatically.
+
+#### VS Code (`.vscode/mcp.json`)
+
+Add to the `servers` section:
+
+```json
+"tavily": {
+  "type": "local",
+  "command": "npx",
+  "args": ["-y", "tavily-mcp@latest"],
+  "tools": ["*"]
+}
+```
+
+With `type: local`, the npx process inherits `TAVILY_API_KEY` from the User-level environment variable set in step 3 — no `env` block or hard-coded key is needed. (If you prefer to pass it explicitly, use `"env": { "TAVILY_API_KEY": "${env:TAVILY_API_KEY}" }` — note the `env:` prefix required by VS Code.)
+
+### 5. Verify
+
+- **Copilot CLI:** Run `/restart`, then `/mcp` — tavily should show ✅
+- **VS Code:** Reload window, check MCP server status
+
+### Available Tavily tools
+
+| Tool | Purpose |
+|------|---------|
+| `tavily_search` | Web keyword search |
+| `tavily_extract` | Extract structured content from a URL |
+| `tavily_crawl` | Crawl a website |
+| `tavily_map` | Generate site structure map |
+| `tavily_research` | Deep research (multi-round search) |
 
 ## Quick Start
 

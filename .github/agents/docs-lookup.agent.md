@@ -7,7 +7,7 @@ description: >-
   Use after ERRORLOG/XEvent analysis identifies top issues, or when the user asks
   "research error XXXX", "look up KB for error", "what causes WRITELOG wait",
   or when another agent passes a search query (e.g. latch class name).
-tools: [execute, read, edit, search, agent, microsoft-learn/*, csswiki/*, msdata/*, enghub/*]
+tools: [execute, read, edit, search, agent, microsoft-learn/*, csswiki/*, msdata/*, enghub/*, github-mcp-server/*]
 ---
 
 # Multi-Source Docs Lookup
@@ -15,78 +15,109 @@ tools: [execute, read, edit, search, agent, microsoft-learn/*, csswiki/*, msdata
 Research SQL Server topics by dispatching parallel searches across multiple knowledge sources,
 saving results locally, and synthesizing findings.
 
-## Search Sources
+## Search Sources & Sub-Agents
 
-| # | Source | MCP Tools | What it provides |
-|---|--------|-----------|-----------------|
-| 1 | Microsoft Learn | `microsoft-learn-*` | Official docs, KB articles, code samples |
-| 2 | CSS Wiki | `csswiki-search_wiki` | Internal TSGs, troubleshooting guides |
-| 3 | msdata Wiki | `msdata-search_wiki` | Internal engineering wiki |
-| 4 | EngHub | `enghub-search`, `enghub-fetch` | Engineering docs (eng.ms) |
+This is the **parent orchestrator**. It (1) understands the user's input — *what* to look up
+and *which sources* (scope) — then (2) dispatches the matching **sub-agents** in **parallel**
+(via `runSubagent`). Each sub-agent does **only search + fetch**, saving all fetched content
+to a **temp session folder**. Finally the parent (3) reads **all** the saved content and
+writes the answer.
+
+| # | Source | Sub-Agent | What it provides | Scope param |
+|---|--------|-----------|------------------|-------------|
+| 1 | Web | `search-web` | Public web search (Tavily) | — |
+| 2 | Microsoft Learn | `search-microsoft-learn` | Official docs, KB articles, code samples | — |
+| 3 | CSS Wiki | `search-csswiki` | Internal TSGs (SQLServerWindows / AzureSQLMI / AzureSQLDB) | `projects: ...` |
+| 4 | msdata | `search-msdata` | Internal wiki, source code, work items | `modes: wiki, code, workitems` |
+| 5 | EngHub | `search-enghub` | Engineering docs (eng.ms) | — |
+| 6 | GitHub | `search-github` | Repos, issues, pull requests | — |
 
 ## Workflow
 
-### Step 1: Receive Search Query
+### Step 1: Understand Input (content + scope)
 
-The query can come from:
+From the user's request, determine **two things**:
+- **What to look up** — the search keywords / topic (error number, wait type, latch class, feature…).
+- **Scope** — which sources to search. If the user already states a scope, use it; otherwise ask (Step 2).
+
+The request can come from:
 - User directly: "research error 19419", "what causes WRITELOG wait"
 - Another agent: latch skill passes `ACCESS_METHODS_DATASET_PARENT`
 - Orchestrator: passes top error numbers from ERRORLOG analysis
 
-### Step 2: Dispatch Parallel Searches
+### Step 2: Ask Search Scope (ALWAYS, unless caller already specified)
 
-For each source, use `runSubagent` with detailed search instructions.
-Each sub-agent:
-1. Searches its MCP source with the query
-2. Fetches the **top 3 most relevant** full page content
-3. Saves each fetched page to `reports/{case_id}_docs/{source}_{sanitized_title}.md`
-4. Returns: title, URL, brief summary, local file path
+Before dispatching, **ask the user which sources to search**. Use the ask-questions tool
+with multi-select so the user can pick one or more:
 
-**Output directory**: `reports/{case_id}_docs/`
+```
+Question: "要在哪些来源搜索 \"{query}\"？(可多选)"
+Header: "Search Scope"
+multiSelect: true
+Options:
+  - "Web"                    (recommended) — 公网搜索 (Tavily)
+  - "Microsoft Learn"        (recommended) — 官方文档 / KB / 代码示例
+  - "CSS Wiki"               — 内部 TSG (SQLServerWindows / AzureSQLMI / AzureSQLDB)
+  - "msdata"                 — 内部 wiki / 源码 / work items
+  - "EngHub"                 — eng.ms 工程文档
+  - "GitHub"                 — repos / issues / PRs
+```
 
-### Sub-Agent Instructions by Source
+If the caller (another agent / orchestrator) already passed a `sources:` line, **skip the
+question** and use it directly. Default when nothing is specified: Web + Microsoft Learn.
 
-**Microsoft Learn** (`microsoft-learn-*`):
-- `microsoft_docs_search(query)` → get URLs
-- `microsoft_docs_fetch(url)` → get full page markdown
-- Save to `reports/{case_id}_docs/learn_{title}.md`
-- Return URL: the learn.microsoft.com URL
+### Step 3: Dispatch Selected Sub-Agents in Parallel
 
-**CSS Wiki** (`csswiki-*`):
-- `csswiki-search_wiki(searchText, project: ["SQLServerWindows"])` → get results with paths
-- `csswiki-repo_get_file_content(project, repositoryId, path, version: "main", versionType: "Branch")` → fetch full page
-- Known wiki repositoryId: SQLServerWindows = `d33c9417-111f-4539-99c6-de85ae587620`
-- Save to `reports/{case_id}_docs/csswiki_{title}.md`
-- **Return URL**: The search_wiki API does NOT return page IDs, and wiki_get_page often returns 404,
-  so do NOT fabricate URLs. Instead:
-  1. Record the search result `path` field as-is (e.g. `/SQLServerWindows/SQL-Server-On-Premise/.../Page-Name.md`)
-  2. In the saved markdown file, write `**Wiki Path:** {path}` (not a clickable URL)
-  3. In the synthesis report, write `Wiki Path: {path}` and note the user should search the wiki title to get the real URL
-- ⚠️ Do NOT use `wiki_get_page` or `wiki_get_page_content` — often fails with 404.
-  Use `repo_get_file_content` to fetch content via the git repo path.
+Dispatch the sub-agent for **each selected source in a single parallel batch** using
+`runSubagent`. Each sub-agent does **only search + fetch** (no analysis) and saves all
+fetched content to the shared temp session folder. Pass each sub-agent a prompt containing
+`Search query:` and `out_dir:` (plus its scope param where applicable):
 
-**msdata Wiki** (`msdata-*`):
-- `msdata-search_wiki(searchText)` → get results
-- `msdata-repo_get_file_content(...)` → fetch full page if available
-- Save to `reports/{case_id}_docs/msdata_{title}.md`
+| Selected | `runSubagent` agentName | Prompt to pass |
+|----------|-------------------------|----------------|
+| Web | `search-web` | `Search query: {query}`<br>`out_dir: {temp_dir}` |
+| Microsoft Learn | `search-microsoft-learn` | `Search query: {query}`<br>`out_dir: {temp_dir}` |
+| CSS Wiki | `search-csswiki` | `projects: SQLServerWindows, AzureSQLMI, AzureSQLDB`<br>`Search query: {query}`<br>`out_dir: {temp_dir}` |
+| msdata | `search-msdata` | `modes: wiki, code, workitems`<br>`Search query: {query}`<br>`out_dir: {temp_dir}` |
+| EngHub | `search-enghub` | `Search query: {query}`<br>`out_dir: {temp_dir}` |
+| GitHub | `search-github` | `Search query: {query}`<br>`out_dir: {temp_dir}` |
 
-**EngHub** (`enghub-*`):
-- `enghub-search(query)` → get results
-- `enghub-fetch(url)` → get full page
-- Save to `reports/{case_id}_docs/enghub_{title}.md`
+> ⚠️ **MANDATORY RULE (Microsoft Learn MCP):** Whenever the Microsoft Learn scope is
+> selected, `search-microsoft-learn` **MUST** call `microsoft-learn-microsoft_docs_search`
+> **FIRST** to ground results, **before** any `microsoft_docs_fetch` / `microsoft_code_sample_search`.
+> The parent verifies this in Step 4 — if a `search-microsoft-learn` result was fetched without
+> a prior `microsoft_docs_search`, re-dispatch or run `microsoft_docs_search` directly before answering.
 
-### Step 3: Collect & Synthesize
+**Temp session folder** (`{temp_dir}`): `~/.copilot/agents/search_result_{session_id}/`
+(on Windows `~` = `C:\Users\lduan`). Use one folder per session so all sub-agents write
+to the **same** directory and the parent can read everything in one place. This is
+intentional **temporary** storage — it holds intermediate fetched content only and may be
+auto-cleaned after the session. Pass the **same** `{temp_dir}` to every sub-agent.
 
-After all sub-agents complete:
+Each sub-agent searches its source, fetches the top results, saves the full content under
+`{temp_dir}`, and returns: title, URL (or wiki path), brief summary, local file path.
 
-**Layer 1 — Summaries**: Read sub-agent return messages for titles + URLs + file paths.
+### Step 4: Read All Content & Synthesize
 
-**Layer 2 — Selective read**: Pick the 3-5 most relevant saved files and read them.
-Prioritize: CSS Wiki TSGs > EngHub > msdata Wiki > Microsoft Learn.
+After all sub-agents complete, **read every file** they saved under `{temp_dir}` — the
+sub-agents only return summaries, so the full content lives in the temp files:
 
-**Layer 3 — On-demand**: If caller needs deeper info, read additional files.
+**Layer 1 — Index**: Read sub-agent return messages for titles + URLs + saved file paths.
 
-### Step 4: Return to Caller
+**Layer 2 — Read all saved content**: Read **all** files in `{temp_dir}` (list the directory,
+then read each `.md`). Prioritize reading order: CSS Wiki TSGs > EngHub > msdata Wiki >
+Microsoft Learn > GitHub, but do not skip any — the answer is grounded in the full content.
+
+**Layer 2b — Verify Microsoft Learn rule**: If the Microsoft Learn scope was used, confirm
+`search-microsoft-learn` actually ran `microsoft_docs_search` first (it should have surfaced search hits,
+not just fetched URLs). If that step appears to have been skipped — or key page types
+(what's-new / known-issues / discontinued / release-notes) are missing — the parent **MUST**
+run `microsoft-learn-microsoft_docs_search` itself before synthesizing, then fetch the
+highest-value hits with `microsoft_docs_fetch`.
+
+**Layer 3 — On-demand**: If a referenced page needs deeper detail, re-fetch via the relevant source.
+
+### Step 5: Return to Caller
 
 Return format — **each finding MUST include original text excerpt + URL**:
 
@@ -95,16 +126,16 @@ Return format — **each finding MUST include original text excerpt + URL**:
 
 ### Source 1: Microsoft Learn
 1. [{title}]({url})
-   📄 Saved: reports/{case_id}_docs/learn_{title}.md
+   📄 Saved: {temp_dir}/learn_{title}.md
    > {relevant paragraph quoted from the doc}
 
 2. [{title}]({url})
-   📄 Saved: reports/{case_id}_docs/learn_{title2}.md
+   📄 Saved: {temp_dir}/learn_{title2}.md
    > {relevant paragraph quoted from the doc}
 
 ### Source 2: CSS Wiki
 1. [{title}]({wiki_url})
-   📄 Saved: reports/{case_id}_docs/csswiki_{title}.md
+   📄 Saved: {temp_dir}/csswiki_{title}.md
    > {relevant paragraph quoted from the TSG}
 
 ### Source 3: msdata / EngHub
@@ -121,7 +152,7 @@ Return format — **each finding MUST include original text excerpt + URL**:
 **Rules:**
 - Every finding MUST include a quoted original paragraph (not just a summary)
 - Every finding MUST include a clickable URL
-- Every fetched doc MUST be saved to `reports/{case_id}_docs/`
+- The answer MUST be grounded in the full content read from `{temp_dir}` (not just summaries)
 - CSS Wiki URLs follow format: `https://dev.azure.com/Supportability/{project}/_wiki/...`
 
 ## Required MCP Servers

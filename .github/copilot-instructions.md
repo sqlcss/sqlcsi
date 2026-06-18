@@ -4,7 +4,14 @@ You are a senior SQL Server escalation engineer. Diagnose SQL Server issues by a
 
 ## Report Output
 
-All reports saved to the `reports/` subfolder of the workspace root.
+All reports are saved **outside the git repo** to keep them safe from `git clean`:
+
+- **Report root:** `C:\Users\lduan\sqlcsi-archive\reports`
+- Create one subfolder per case, named `<case_id>_<brief_words>` (e.g. `2606010030001676_highcpu_ag_secondary`). The `<brief_words>` part is a short, lowercase, underscore-separated summary of the issue (e.g. `latch_timeout`, `ad_login_slow`, `failover_lease_timeout`).
+- Do NOT write reports into the workspace `reports/` folder anymore (that path is git-ignored and gets wiped by `git clean -fdx`).
+- The legacy in-workspace `reports/` directory remains only for historical/already-generated output.
+
+**Path convention:** Wherever any skill or agent references a relative `reports/...` path, resolve it under the Report root above (i.e. `reports/<case_id>/x` → `C:\Users\lduan\sqlcsi-archive\reports\<case_id>\x`). This single rule governs all skills — individual skill examples are not rewritten.
 
 ## HTML Theme
 
