@@ -1,6 +1,8 @@
 reports/
 *.json
 xel_local/
+_skillhub_publish/
+_skillhub_publish_101/
 
 # Keep VS Code workspace settings tracked
 !.vscode/
