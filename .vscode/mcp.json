@@ -18,6 +18,19 @@
       "command": "npx",
       "args": ["-y", "@azure-devops/mcp@next", "msdata"]
     },
+    "sqlclientdrivers": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@azure-devops/mcp@next", "sqlclientdrivers"]
+    },
+    "microsoft": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@azure-devops/mcp@next", "microsoft", "-d", "core", "search", "repositories"],
+      "env": {
+        "ado_mcp_project": "OS"
+      }
+    },
     "microsoft-learn": {
       "type": "http",
       "url": "https://learn.microsoft.com/api/mcp"
