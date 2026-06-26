@@ -108,7 +108,8 @@ and to set the investigation time window.
 |---|------|--------|-----|
 | 4 | **New primary ERRORLOG** | Partner replica | Compare DTC RM GUIDs, confirm new primary recovered successfully → proves issue is isolated to old primary |
 | 5 | **system_health XEL** | SQL Server | `wait_info`, `scheduler_monitor`, `sp_server_diagnostics` during stuck period |
-| 6 | **Windows Cluster log** | `Get-ClusterLog` | WSFC heartbeat/communication failure details (Error 1722 etc.) |
+| 6 | **Windows Cluster log (BOTH nodes)** | `Get-ClusterLog` on each node | WSFC heartbeat/communication failure details (Error 1722 etc.). Required by `cluster-review` if the trigger is a cluster error — collect from **both** nodes. |
+| 6b | **Cluster registry hive** | `%SystemRoot%\Cluster\CLUSDB` or a collected `*_reg_Cluster.hiv` | Authoritative quorum/vote-weight/witness/fault-domain config. Needed by `cluster-review` Phase 2 to prove a config root cause. |
 
 #### If Issue Is Still Active (Not Yet Restarted)
 
@@ -509,6 +510,7 @@ Trigger Type?
 │                    ┌─────────────────────────┘
 │                    ▼
 │          *** Cluster / Infrastructure Investigation ***
+│          → INVOKE the `cluster-review` skill (see Phase 6c)
 │          → Check perf counter: if CPU/IO normal, confirms not performance related
 │          → Check WSFC network, quorum, storage
 │          → Check cluster log for node heartbeat failures
@@ -670,6 +672,36 @@ Only evidence is continued `Remote harden failed` messages.
 ### Phase 6: Per-Failover Analysis Report
 
 For each failover incident, write an analysis section following this structure.
+
+#### Report Skeleton — mirror the reference report (`2606230030003998_ag_failover_report.md`)
+
+The final report MUST follow this top-level layout. The detailed per-FO specs
+(6.1–6.5 below) are the **building blocks** that feed these sections; for a
+multi-flap incident, MERGE the flaps into ONE unified timeline/evidence list
+rather than repeating per-FO.
+
+| § | Section | Built from | Mandatory? |
+|---|---------|-----------|-----------|
+| 1 | **执行摘要** (executive summary) | new — see §6.0 below | **Always** |
+| 2 | **环境与拓扑** (environment & topology) | Phase 1 + Server/AG summary | Always |
+| 3 | **根本原因（含权威证据）** (root cause + verbatim evidence) | 6.1 trigger + cluster-review §C | Always |
+| 4 | **完整时间线** (numbered unified timeline) | new — see §6.A below | Always |
+| 5 | **时间线逐步证据** (verbatim, one raw log per step) | new — see §6.B below | Always |
+| 6 | **为什么没有自动 failover** (why no auto-failover) | new — see §6.C below | When the AG did NOT auto-fail-over |
+| 7 | **隔离 (Quarantine) 分析** | cluster-review | When node quarantine (5985) seen |
+| 8 | **数据丢失分析** (data loss) | new — see §6.D below | Always (even if "no loss") |
+| 9 | **逐库状态** (per-DB status) | 6.4 per-DB table | Always |
+| 10 | **建议** (recommendations) | Phase 7 / docs-lookup | Always |
+| 11 | **Cluster 配置总结（来自注册表 hive 权威枚举）** | cluster-review Phase 1 (§F) | When cluster-review ran |
+
+> ⚠️ **Trigger ≠ enabling root cause.** Keep the two layers distinct in EVERY
+> section. The **trigger** is the immediate event (WSFC heartbeat flap / quorum
+> loss / lease timeout). The **enabling root cause** is the configuration state
+> that turned a transient trigger into a stuck/loss outage — and it may live in a
+> **different layer**: WSFC config (zero-weight node / no witness / site
+> misconfig → `cluster-review`) OR the AG/DDL layer (e.g. `FAILOVER_MODE = MANUAL`
+> blocking auto-failover → confirm from `alwayson_ddl_executed`). Never collapse
+> "what knocked the primary down" with "why it stayed down / didn't fail over."
 
 **ANALYSIS WORKFLOW:**
 
@@ -937,6 +969,95 @@ For cases with multiple failovers, compare:
 - Why did FO2 succeed (same DBs, same host) but FO3 fail?
 - What was different about the system state?
 
+---
+
+### Phase 6 — Report-Level Sections (mirror reference §§1, 4, 5, 6, 8)
+
+These cross-cutting sections sit ABOVE the per-FO detail and are what make the
+report audit-grade. Build them from the same verbatim evidence you already
+collected — do NOT paraphrase.
+
+#### 6.0 Executive Summary (§1) — Trigger vs Root Cause
+
+One table at the very top, columns:
+
+| Field | What to fill |
+|-------|-------------|
+| **触发器 (Trigger)** | The immediate event (e.g. "WSFC 跨站点心跳闪断 3 次 → SH 失去仲裁") |
+| **根本原因 (enabling root cause)** | The config that made it stick / blocked failover — name the layer (WSFC: zero-weight + no witness / site misconfig; **or** AG/DDL: `FAILOVER_MODE = MANUAL`). If it belongs to the cluster layer, point to §11; if AG/DDL, cite the `alwayson_ddl_executed` evidence. |
+| **闪断次数 (flap count)** | N — count **only the failure/flap incidents**. A user-initiated `ALTER…FAILOVER` (the planned recovery) is **NOT** a flap; report it separately as the recovery, not as an (N+1)th failure. |
+| **为什么卡住 (~Xh)** | quarantine window / manual-failover wait |
+| **为什么没有自动 failover** | one line → §6 |
+| **数据丢失** | yes/no + boundary LSN → §8 |
+| **恢复方式/耗时** | how it recovered (manual failover, link heal) + duration |
+
+#### 6.A Unified Numbered Timeline (§4)
+
+ONE table merging BOTH nodes across ALL flaps + quarantine + recovery. Columns:
+**序号 ｜ 本地时间(UTC+8) ｜ 节点 ｜ 事件 ｜ 含义 ｜ 来源**. Convert cluster.log (UTC)
+to server-local; tag each row's source (cluster.log / ERRORLOG / XEvent). This is
+the single chronological spine of the incident.
+
+> **Incident vs recovery in the count:** `failover_incidents.json` may yield e.g.
+> 4 "incidents" while operators think of it as "3 flaps + 1 manual recovery".
+> Classify each row: a transition driven by quorum loss / heartbeat flap is a
+> **failure (flap)**; a transition driven by a user-initiated `ALTER…FAILOVER`
+> (no `FORCE_FAILOVER_ALLOW_DATA_LOSS`, target SYNCHRONIZED) is the **planned
+> recovery**. The §1 flap count and the §4 timeline must agree with the operator
+> framing — label the recovery row as recovery, do not inflate the failure count.
+
+#### 6.B Verbatim Per-Step Evidence (§5)
+
+For EACH numbered step in §6.A, a `证据 N — 步骤X 时间 节点 …` block containing the
+**actual raw log line(s)** (cluster.log UTC / ERRORLOG / XEvent local), labelled
+with step #, time, node, source. One raw line per step; the full causal chain
+(trigger → quorum loss → AG offline → quarantine → recovery → revert/loss
+boundary) must appear verbatim. This section is mandatory — it is the difference
+between "too brief" and audit-grade.
+
+#### 6.C Why No Auto-Failover (§6) — only if the AG did NOT auto-fail-over
+
+When the AG stayed on the dead/old primary or required a manual failover, prove
+WHY the automatic failover did not happen. Walk the conditions in order, each
+with verbatim evidence:
+
+1. **availability_mode** — was it `SYNCHRONOUS_COMMIT`? (auto-failover requires
+   sync commit on BOTH the failed and target replica). Cite the AG config snapshot
+   (`*.rpt` / `sys.availability_replicas`).
+2. **failover_mode** — was it `AUTOMATIC` or `MANUAL`? `MANUAL` statically removes
+   the replica from WSFC PossibleOwners → **no auto-failover**. Confirm from
+   `alwayson_ddl_executed` (XEvent) — the DDL that set/reverted it, with timestamps.
+3. **Was the target replica actually behind?** Show the **LSN evidence** (hardened
+   / end-of-log LSN on the survivor was current, not lagging) to rule out
+   "secondary too far behind" as the reason.
+4. **Did WSFC ever try to online the AG on the survivor?** Cross-reference
+   `cluster-review` checkpoint 7 (PossibleOwnerFilter / `IsPossibleOwner:false` /
+   ban code 5016 / group `Orphaned→Offline`). Watch for **either** fingerprint:
+   (a) the survivor is **explicitly banned** (`IsPossibleOwner:false` / ban 5016),
+   or (b) the survivor is **simply absent from the placement candidates** — e.g.
+   `[RCM-plcmt] Group <AG> allowed to move to node <N>` lists only the down/old
+   owner, with no `IsPossibleOwner:false` line for the survivor at all (it was
+   removed from PossibleOwners earlier, often a static state). If WSFC never
+   attempted placement on the survivor → the exclusion is the cause.
+5. **AlwaysOn_health role machine (both nodes)** — quote the verbatim role
+   transitions showing the promotion was **user-initiated**, with no prior
+   automatic-promotion attempt.
+
+State explicitly whether the block was a **static config state** (MANUAL mode) or
+a **dynamic** sync-state removal — do not assert the SQL-layer cause from
+cluster.log alone.
+
+#### 6.D Data Loss Analysis (§8)
+
+Always include, even to state "no committed data lost." Identify the
+**recovery / revert boundary LSN** on the node that came back as the new
+secondary (`Recovery LSN` / `Reverting begin: Total logs to revert [N]`), compare
+against the survivor's hardened LSN, and conclude whether any **committed**
+transaction was lost. Cite the verbatim `Reverting` / `Recovery` ERRORLOG lines
+and the hardened-LSN XEvent rows.
+
+---
+
 ### Phase 6b: Invoke stuck-db-analysis (Conditional)
 
 **Trigger condition:** Any FO has databases that did NOT recover (Category B or C).
@@ -964,21 +1085,113 @@ Before running analysis, read the pre-cached source code KB:
 
 Save to: `reports/{case_id}_fo{N}_stuck_analysis.md`
 
+### Phase 6c: Invoke cluster-review (Conditional)
+
+**Trigger condition:** The failover was caused by a **cluster-side** problem
+(quorum loss / node eviction / WSFC communication), NOT a SQL lease/health/CPU
+timeout. Invoke when ANY of these hold:
+
+- Phase 4b Step 3 routed to the **Cluster / Infrastructure** branch.
+- **ERRORLOG contains AG / WSFC error numbers** (the usual entry signal — the
+  investigation begins from AG failover, so these ERRORLOG errors are where the
+  cluster-side cause first surfaces):
+  `1135` (node evicted), `19407`/`19419`/`19421` (lease / heartbeat), `41005`
+  (WSFC event notification failed), `41009`, `41034` (AG/WSFC resource online /
+  cluster op error), `41048`, `41049`, `41066`, `41091` (WSFC lost quorum),
+  `41142`, `41143`, `41144`, `41160`, `41161`, or any `The Cluster service ...` /
+  `node ... was removed` text.
+- cluster.log / System event log shows `5925` (lost quorum), `5985` (quarantined),
+  `1177` (quorum-loss shutdown), `1564` (FSW failure), `1069` (resource failed).
+- The **same node loses every flap** (structural asymmetry suspected).
+
+**When NOT to invoke:** trigger was SQL lease/health/CPU timeout with no quorum
+loss → stay in the performance path (Phase 4b Steps 5–8).
+
+**How to invoke:**
+Read the cluster-review skill from `.github/skills/cluster-review/SKILL.md`.
+Before scanning, read the signature catalog KB:
+- `.github/skills/cluster-review/reference/cluster_log_signatures.md`
+
+**cluster-review starts with a Phase 0 Input Gate:** it STOPS and scans the case
+dir for the Windows **event logs** (`*.evtx`) and the **cluster registry hive**
+(`*_reg_Cluster.hiv` / `CLUSDB`) plus cluster.log from BOTH nodes. These are
+often NOT in the initial AG-failover collection — if missing, it asks the user to
+provide them (with the exact `Get-ClusterLog` / `reg save` / `wevtutil` commands)
+before continuing.
+
+Provide it: cluster.log from **both** nodes, the Cluster registry hive
+(`*_reg_Cluster.hiv` / `CLUSDB`), the Windows event logs (`System.evtx`,
+`*FailoverClustering*.evtx`), both ERRORLOGs, the incident time + UTC offset,
+and the node→site mapping.
+
+**What it produces:**
+- A **dual artifact**: (a) a single NUMBERED unified UTC→local cluster.log
+  timeline across BOTH nodes (10 checkpoints, including #0 last-good-heartbeat and
+  #7 AG group placement / PossibleOwner), and (b) a **verbatim per-step evidence**
+  list (one raw cluster.log line per checkpoint).
+- Authoritative config audit from the hive (witness?, per-node NodeWeight,
+  fault domains, networks, tunables) — the **§11 "Cluster 配置总结"** section,
+  sub-sections 11.1–11.9 (cluster body, quorum/witness, node votes, site fault
+  domain, networks, heartbeat thresholds, resources, root-cause conclusion,
+  remediation steps).
+- A **trigger vs enabling-root-cause** split: the heartbeat flap is the trigger;
+  the hive config (zero-weight node / missing witness / site misconfig) is the
+  enabling root cause.
+- Root-cause classification (zero-weight node / missing witness / site misconfig /
+  single heartbeat path) backed by the exact hive value + cluster.log line.
+- A parameterized remediation command template.
+
+> ⚠️ **cluster.log provenance gate:** cluster-review validates each cluster.log
+> header (`Current node` / `Build Number` / time-zone offset) against the case's
+> AG nodes, OS build, and site. If a `node1_Cluster.log` / `node2_Cluster.log`
+> belongs to a DIFFERENT cluster (wrong node names / OS / TZ), it is DISCARDED and
+> NOT used. Only validated per-node logs feed the timeline.
+
+**Integrate cluster-review's output into the final report:**
+- Its §11 hive-config audit → the report's **§11 (Cluster 配置总结)** verbatim.
+- Its numbered timeline → merged into the report's **§4 unified timeline** (§6.A).
+- Its verbatim per-step lines → folded into **§5 逐步证据** (§6.B).
+- Its quarantine finding → the report's **§7 (隔离分析)**.
+- If it concludes the enabling root cause is cluster-layer, the report's **§1
+  执行摘要** root-cause cell points to §11; the WSFC flap stays labelled as the
+  trigger.
+
+> ⚠️ **§11 hive enumeration OVERRIDES any narrative §2.** The Cluster registry
+> hive (`*_reg_Cluster.hiv` / `CLUSDB`) is the **authoritative** source for
+> witness presence, per-node `NodeWeight`, fault domains, and tunables. If a
+> narrative / customer description in §2 disagrees with the hive (e.g. §2 says
+> "FSW, weights=(2)" but the hive shows **no witness, NodeWeight 0/1**), use the
+> **hive values** everywhere and add an explicit **reconciliation note** in §11
+> flagging the conflict and which source you trust (the hive) and why. Never let
+> a stale narrative override the enumerated config.
+
+Save to: `reports/{case_id}_cluster_review.md`
+
 ### Phase 7: Generate HTML Report
 
 Generate an HTML report using the Catppuccin Mocha dark theme.
-The report structure follows Phase 6 — for each FO:
+The report MUST mirror the reference report's §1–§11 layout (see the **Report
+Skeleton** table in Phase 6). Render these top-level sections in order:
 
-1. **Trigger** — raw ERRORLOG/XEvent evidence, then one-line conclusion
-2. **AG Flow** — raw state change messages from both hosts
-3. **Per-DB Status Table** — full table with actual timestamps
-4. **Key Observations** — derived from evidence, with references
-5. **Cross-FO Comparison** — if multiple FOs
+1. **§1 执行摘要** — exec-summary table with the explicit **Trigger vs enabling
+   Root Cause** split (plus flap count, why-stuck, why-no-auto-failover, data
+   loss, recovery). Put this first, above everything.
+2. **§2 环境与拓扑** — version, AG config, DTC, replica topology, node→site map.
+3. **§3 根本原因** — verbatim causal-chain evidence (cluster.log / ERRORLOG).
+4. **§4 完整时间线** — ONE numbered cross-node table
+   (序号｜本地时间(UTC+8)｜节点｜事件｜含义｜来源).
+5. **§5 时间线逐步证据** — `证据 N` blocks, one raw log line per timeline step.
+6. **§6 为什么没有自动 failover** — only if the AG did not auto-fail-over
+   (availability_mode / failover_mode=MANUAL / LSN-not-behind / WSFC
+   PossibleOwner exclusion / AlwaysOn_health role machine).
+7. **§7 隔离 (Quarantine) 分析** — when node quarantine (5985) was seen.
+8. **§8 数据丢失分析** — boundary LSN + committed-loss verdict (always present).
+9. **§9 逐库状态** — the per-DB status table(s) (Phase 6.4); one per FO if needed.
+10. **§10 建议** — dump collection, WSFC/AG remediation (from docs-lookup).
+11. **§11 Cluster 配置总结** — cluster-review's hive audit (11.1–11.9), when it ran.
 
-Report-wide sections:
-- **Server & AG Summary** — version, AG config, DTC, replica topology
-- **Failover Overview** — table of all incidents with result
-- **Recommendations** — dump collection, WSFC investigation
+Keep the per-FO detail (6.1 Trigger / 6.2 AG Flow / 6.4 Per-DB / 6.5 Cross-FO) as
+collapsible sub-blocks feeding §3–§5 and §9 — do not duplicate the timeline.
 
 Save to: `reports/{case_id}_ag_failover_report.html`
 
