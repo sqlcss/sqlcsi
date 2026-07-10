@@ -59,6 +59,13 @@ Activate when the user:
 
 ### Phase 0: Path & Surface Selection
 
+**First run the tooling Pre-Check** (SKILL.md §Step 0). Verify **WinDbgCsExt**
+(cdb mirror extension) and **DumpViewer + SqlScriptRepl** (self-hosted REPL) are
+installed. If a required surface is **missing, STOP and prompt the user to install
+it** using the Step 0 install prompts — do NOT silently fall through to a broken path.
+Never copy `DumpViewer.exe` into the `WinDbgCs.amd64` folder (they are different
+tools; each must stay self-contained).
+
 ```
 IF dump_path provided AND cdb.exe reachable → Path A (cdb.exe CLI, preferred)
 ELSE IF user says "generate commands"/"WinDbg" → Path B (WinDbg GUI block)

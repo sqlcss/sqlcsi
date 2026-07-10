@@ -49,6 +49,10 @@
       "type": "http",
       "url": "https://sqlops-mcp.azurewebsites.net/"
     },
+    "SqlOps-dev": {
+      "type": "http",
+      "url": "https://sqlops-mcp-test.azurewebsites.net"
+    },
     "bluebird-mcp-sql": {
       "type": "http",
       "url": "https://mcp.bluebird-ai.net/",

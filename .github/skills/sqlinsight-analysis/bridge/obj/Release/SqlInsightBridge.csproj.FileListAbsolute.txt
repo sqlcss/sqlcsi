@@ -1,0 +1,11 @@
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\bin\Release\SqlInsightBridge.deps.json
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\bin\Release\SqlInsightBridge.dll
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\bin\Release\SqlInsightBridge.pdb
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\obj\Release\SqlInsightBridge.csproj.AssemblyReference.cache
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\obj\Release\SqlInsightBridge.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\obj\Release\SqlInsightBridge.AssemblyInfoInputs.cache
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\obj\Release\SqlInsightBridge.AssemblyInfo.cs
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\obj\Release\SqlInsightBridge.csproj.CoreCompileInputs.cache
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\obj\Release\SqlInsightBridge.sourcelink.json
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\obj\Release\SqlInsightBridge.dll
+C:\Users\lduan\sqlcsi\.github\skills\sqlinsight-analysis\bridge\obj\Release\SqlInsightBridge.pdb

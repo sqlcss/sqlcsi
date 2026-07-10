@@ -5,6 +5,7 @@ description: >-
   Use when the user says "analyze errorlog", "parse errorlog", "分析 errorlog", provides
   a path to an ERRORLOG file, or says "what errors are in this log".
 tools: ['terminal', 'readFile', 'editFile']
+agents: [import-xevent, analyze-xevent]
 ---
 
 # ERRORLOG Analysis
@@ -249,6 +250,48 @@ insufficient.*memory|process memory has been paged out
 # LSN in message
 LSN[:\s]*\(?(\d+:\d+:\d+)\)?
 ```
+
+---
+
+---
+
+## Step 4: Cross-Reference XEvent Data (RESOURCE / Memory Analysis)
+
+If a `xel_path` was provided **OR** `system_health*.xel` files are found alongside the
+ERRORLOG, automatically pull XEvent data — especially when ERRORLOG shows memory/resource
+errors. The ERRORLOG only logs the symptom (701, 802, 17189, dumps); the XEvent
+`sp_server_diagnostics` RESOURCE component holds the actual memory committed / target /
+QE reservation / OOM-flag timeline that proves the root cause.
+
+### 4.1 When to Trigger (MANDATORY)
+
+Invoke this step automatically when **any** of these appear in the findings:
+
+| Trigger | Subsystem / Error | Why XEvent is needed |
+|---------|-------------------|----------------------|
+| Error 701/802/8645 | `MEMORY` (701-899) | Confirm which clerk/grant consumed memory |
+| Error 17189 | `SERVICE` | "failed to spawn thread" → worker exhaustion from OOM |
+| Error 901-999 | `RESOURCE` | Resource governor / semaphore state |
+| Stalled dispatcher / non-yield dump | — | sp_diag RESOURCE shows committed-vs-target |
+| AG role change to RESOLVING | `HADR_*` | Correlate with memory_broker pressure |
+
+### 4.2 How to Invoke
+
+1. If a local SQL Server is available → `runSubagent("import-xevent")` to load the .xel
+   into `[xevent_analyze]`, then `runSubagent("analyze-xevent")` with the same
+   `{window_start}`/`{window_end}` as the ERRORLOG incident window.
+2. If no local SQL Server → `runSubagent("analyze-xevent")` (Path B: PowerShell extract +
+   `scripts/parse_xevent.js`).
+
+### 4.3 Must-Extract Records
+
+- `sp_server_diagnostics` **RESOURCE** — lastNotification, outOfMemoryExceptions, Target/Current Committed, Locked Pages, QE reservations
+- `sp_server_diagnostics` **QUERY_PROCESSING** — maxWorkers, workersCreated, idleWorkers, pendingTasks
+- `memory_broker_clerks` — currently_allocated, new_target, notification
+- `scheduler_monitor` — memory_utilization, system_idle
+
+Stitch these into the timeline so memory committed at each 5-min sample lines up with the
+701/17189 ERRORLOG entries.
 
 ---
 

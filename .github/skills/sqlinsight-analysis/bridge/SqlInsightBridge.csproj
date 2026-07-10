@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>SqlInsightBridge</AssemblyName>
+    <RootNamespace>SqlInsightBridge</RootNamespace>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>CS8002;CS0436</NoWarn>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- Override on the command line: dotnet build /p:DumpViewerDir=... -->
+    <DumpViewerDir Condition="'$(DumpViewerDir)' == ''">C:\Users\lduan\tools\DumpViewer</DumpViewerDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="DumpViewer"><HintPath>$(DumpViewerDir)\DumpViewer.exe</HintPath><Private>false</Private></Reference>
+    <Reference Include="CsDebugScript.Common"><HintPath>$(DumpViewerDir)\CsDebugScript.Common.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="CsDebugScript.Engine"><HintPath>$(DumpViewerDir)\CsDebugScript.Engine.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="CsDebugScript.Utils"><HintPath>$(DumpViewerDir)\CsDebugScript.Utils.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="CsDebugScript.DbgEngInterfaces"><HintPath>$(DumpViewerDir)\CsDebugScript.DbgEngInterfaces.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>
