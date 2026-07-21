@@ -17,6 +17,9 @@
 #
 # Inputs: the 9 raw txt captures named {CaseId}_{expr}.txt in {TxtDir}
 # (produced by !execute via cdb+!dcs_initsymsvr or SqlScriptRepl — see SKILL 1.8).
+# If acquisition used run_windbgcs_direct.ps1, first run split_direct_mirror_log.ps1
+# on the combined `{CaseId}_phase1_direct.txt` log; do not feed/link the combined
+# raw log as the report result.
 # Run with pwsh (PS7) — powershell 5.1 corrupts the Chinese literals.
 # =============================================================================
 [CmdletBinding()]

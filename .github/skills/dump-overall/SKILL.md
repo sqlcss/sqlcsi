@@ -113,22 +113,11 @@ decodes the running T-SQL, producing a multi-section snapshot **（纯列举，�
 > 素材去判断 dump 的 **原因与根因（cause & root cause）** 由 **dump-analysis** skill
 > （`.github/skills/dump-analysis`）完成。本 skill 故意不决定任何根因 — 它只产出全局快照。
 
-## Symbol Server Path (ALWAYS USE THIS)
+## Symbol Server Path → single-sourced in `reference/setup.md`
 
-For every cdb/WinDbg session in this skill, use this symbol path:
-
-```
-srv*C:\Symbols*https://symweb.azurefd.net
-```
-
-- Set it at launch (`-y "srv*C:\Symbols*https://symweb.azurefd.net"`) or via
-  `.sympath srv*C:\Symbols*https://symweb.azurefd.net` before `.reload`.
-- `C:\Symbols` is the local downstream cache; private PDBs (sqllang/sqlmin/sqltses) get
-  cached there and `.reload /f` loads them instantly.
-- `symweb.azurefd.net` is the **internal** symbol server — it has SQL private PDBs **and**
-  the SqlCsScripts/Mirrors packages. Do **not** hardcode `msdl.microsoft.com` (has neither).
-- **sympath ordering rule**: an HTTP store must be the LAST/only HTTP store. VPN required
-  for symweb; if unreachable, private symbols/mirrors won't load — fall back to `kn` only.
+> The symbol path (`srv*C:\Symbols*https://symweb.azurefd.net`), the symweb-internal /
+> msdl warning, and the sympath-ordering rule are single-sourced in
+> [`reference/setup.md`](reference/setup.md) §Symbol Path. Read it there.
 
 ## Required Inputs
 
@@ -164,16 +153,71 @@ srv*C:\Symbols*https://symweb.azurefd.net
 | 2 | **第零步 (PRIMARY) DumpViewer.exe** | `run_dumpviewer.ps1` → `{case}_dump_overall\dumpviewer_out\`. **Auto mode gate:** exit `0`=SUCCESS→**PRIMARY mode**; exit `2`=**FALLBACK mode** (early 2019 CU / older build). | — automated, **no pause** (the mode gate is auto-detected from the exit code) |
 | 3 | **Step 1 Session Setup** | Resolve `cdb.exe`, register DScript CLSIDs (HKCU), launch headless session — needed for the 第三步 DScript supplement + the 4 missing rings (PRIMARY) or the full pipeline (FALLBACK) | — automated, **no pause** |
 | 4 | **第一步 线程形态** | **PRIMARY:** `parse_threaddetails_states.ps1` on `threaddetails.json`(权威 `worker_state`)→ 表 1;表 2 功能分类读 DumpViewer `*Threads` 侧车;link native `ThreadDetails.html` + `UniqueStacks.html`(no `_us.html`). **If parser exits 2**(ThreadDetails empty)→ FALLBACK. **FALLBACK:** `!mex.us` → classify SQLOS worker-state → `parse_us_states.ps1` + `gen_us_html.ps1` → `{case}_us.html`;表 2 功能分类用 `classify_thread_categories.ps1` 复现. **两模式:只内联命中功能桶的线程完整栈** | — automated, **no pause** |
-| 5 | **第二步 Tasks 清单** | **PRIMARY:** parse DumpViewer `Tasks`/`ActiveTasks` sidecars (no pause). **FALLBACK:** EMIT-B-THEN-PAUSE gate for `!execute Tasks.Enumerate` | ⏸️ **P2 (FALLBACK only)** — FIRST print the resolved **(b) 手工 WinDbg block** (`{wdbgcs}`/`{dump_path}` substituted; mirror pair verified `True True`), THEN ask **手工粘结果 vs 自动跑**. manual → wait for the pasted output; auto → run **(a) `run_windbgcs_tasks.ps1`**. In PRIMARY mode this row is **skipped** (data already in DumpViewer). |
+| 5 | **第二步 Tasks 清单** | **PRIMARY:** parse DumpViewer `Tasks`/`ActiveTasks` sidecars (no pause). **FALLBACK:** run `run_windbgcs_tasks.ps1`; if `!dcs_initsymsvr` 404s, seed the build-matched mirror pair with `acquire_mirrors.ps1` and rerun via `run_windbgcs_direct.ps1`; then generate `{case}_tasks.html` + 表 2/3 fragments. | ⏸️ **P2 (FALLBACK only)** — FIRST print the resolved **(b) 手工 WinDbg block** (`{wdbgcs}`/`{dump_path}` substituted; mirror pair verified `True True`), THEN ask **手工粘结果 vs 自动跑**. manual → wait for pasted output; auto → run **(a) `run_windbgcs_tasks.ps1`**. If auto fails because the SymSvrManifest is missing (404), this is setup fallback, not a new user pause: run `acquire_mirrors.ps1` + `run_windbgcs_direct.ps1` and continue. In PRIMARY mode this row is **skipped**. |
 | 6 | **第二步 1.5.6 按调度器分布** | Pivot the SAME 第二步 rows by `SchedulerId` (DumpViewer or FALLBACK source) | — **reuse** step-5 result — NO re-acquisition, **NO second pause** |
 | 7 | **第三步 1.7.1–1.7.2 task.js sweep** | **ALWAYS runs** (DumpViewer does not decode per-thread T-SQL). Identify exec mains + parallel children, `gen_task_sweep.ps1` | ⏸️ **P3** — ASK **auto (cdb headless) vs manual (WinDbg `$$><`)**. Both write the SAME `.logopen` file; you parse that file either way. This choice also governs the tsqlstack sweep (1.7.4). |
 | 8 | **第三步 1.7.3–1.7.5** | Parse → `task_fields.json`; `tsqlstack.js` per main → `{case}_sql_exec_thread.html`; build the two report tables | — automated (runs per the P3 choice), **no pause** |
-| 9 | **第四步 · 调度器清单 (`Schedulers.Enumerate` 优先 / `sys.schedulers.js` fallback)** | SQLOS 调度器清单（≈ `sys.dm_os_schedulers`）。**SQL2022+：** 先 `!execute Schedulers.Enumerate`（同附加步骤 mirror 会话），无输出→回退 `!dscript.run {dscript_path}\...\sys.schedulers.js`。**SQL2022 之前：** 直接 `sys.schedulers.js`（第三步同一 cdb/WinDbg 会话顺带跑） | — automated (reuse P3 / mirror session), **no pause** |
-| 10 | **第五步 · 内存代理清单 (`MemoryBrokers.Enumerate`)** | `!execute MemoryBrokers.Enumerate` — 每 broker 当前状态（≈ `sys.dm_os_memory_brokers`）；与附加步骤的 `!execute` 同一 mirror 会话 | — automated (reuse mirror session), **no pause** |
-| 11 | **第六步 · latch 争用页面 + 线程栈联表 (`dump_latch_contended_pages.js`)** | `!dscript.run {dscript_path}\...\dump_latch_contended_pages.js` 找出 latch 争用页 + 争用 thread ID；再把每个 thread ID 到**第一步**逐线程栈（`threaddetails.json` PRIMARY / `!mex.us` FALLBACK）里反查出完整调用栈。可用第三步同一 cdb/WinDbg 会话顺带跑 | — automated (reuse P3 session), **no pause** |
+| 9 | **第四步 · 调度器清单 (`Schedulers.Enumerate` 优先 / `sys.schedulers.js` fallback)** | SQLOS 调度器清单（≈ `sys.dm_os_schedulers`）。**SQL2022+：** 先 `!execute Schedulers.Enumerate`，无输出→回退 DScript。**SQL2022 之前：** 直接用 `run_dscript_once.ps1 -ScriptPath {dscript_path}\sys.schedulers.js -EndMarker 'END SYS.SCHEDULERS'`。 | — automated (reuse P3 / mirror session), **no pause** |
+| 10 | **第五步 · 内存代理清单 (`MemoryBrokers.Enumerate`)** | `!execute MemoryBrokers.Enumerate` when mirror supports it; otherwise run `run_dscript_once.ps1 -ScriptPath {dscript_path}\sys.dm_os_memory_brokers.js -EndMarker 'END MEMORY BROKERS'`. | — automated (reuse mirror / DScript session), **no pause** |
+| 11 | **第六步 · latch 争用页面 + 线程栈联表 (`dump_latch_contended_pages.js`)** | Run `run_dscript_once.ps1 -ScriptPath {dscript_path}\dump_latch_contended_pages.js -EndMarker 'END LATCH CONTENDED PAGES'`; then join returned thread IDs back to 第一步 stacks. If it prints `No pages found`, keep that raw evidence and still generate the latch subreport. | — automated (reuse P3 session), **no pause** |
 | 12 | **附加步骤 · SOS 环形缓冲** | **PRIMARY:** 5 rings from DumpViewer (`SchedRing`/`MonitorRing`/`OOMRing`/`MemBrokerRing`/`SchedMonitors`) + the **4 missing** via `!execute` (HADR AR ×2 / BlockedProcessReport / MemoryBrokerClerk / ProcessSummary). **FALLBACK:** all 9 via `build_ringbuf_reports.ps1`. | — **reuse** step-5's choice (FALLBACK) or run the 4 supplement `!execute` (PRIMARY), **NO new pause** |
 | 13 | **DoD Gate** | Paste + tick the DEFINITION-OF-DONE checklist | — mandatory self-check, **not a pause** |
 | 13 | **Report Generation** | Assemble the fixed artifact set («Fixed artifact set & structure») | ⏸️ **P4** — ASK **language (English / 中文)** + **format (HTML / Markdown)**, THEN write the report. |
+
+### 固化脚本执行清单 · Stabilized script runbook
+
+The table above is the workflow contract; the concrete script chain below is the stable path
+validated on SQL2016 latch-timeout and SQL2019 CU20 Stalled Dispatcher dumps. Do not replace
+these steps with ad-hoc parsing or one-off HTML generation.
+
+1. **Pre-flight / setup** — run `pre_check.ps1`; run `register_dscript.ps1`; resolve `cdb.exe`,
+  `mex.dll`, `WinDbgCsExt.dll`, `{dscript_path}`, `{sym_path}`, and the archive output folder
+  under `C:\Users\lduan\sqlcsi-archive\reports\<case>_<brief_words>\`.
+2. **DumpViewer primary** — run `run_dumpviewer.ps1`. Exit `0` means consume DumpViewer
+  sidecars with `parse_dumpviewer_json.js` / `parse_threaddetails_states.ps1`; exit `2` means
+  switch to the fallback path without marking the run failed.
+3. **Fallback thread/task inventory** — run `run_mex_us.ps1` -> `parse_us_states.ps1` ->
+  `gen_us_html.ps1` -> `shred_mex_us.ps1` -> `classify_thread_categories.ps1` ->
+  `gen_thread_categories_html.ps1`. The category page must emit stable `cat-<key>` anchors
+  for every bucket, including empty buckets.
+4. **Tasks.Enumerate fallback** — run `run_windbgcs_tasks.ps1`. If `!dcs_initsymsvr` returns a
+  missing `SqlCsScripts.SymSvrManifest.dll` / 404, run `acquire_mirrors.ps1 -Build <version>
+  -Product <SQLServerYYYY> [-CaseDir <case folder>]`, then rerun `Tasks.Enumerate` with
+  `run_windbgcs_direct.ps1 -Scripts <...\NetStandard20Refs\build_<version>\SqlCsScripts.dll>`.
+  Preserve the failed init log as evidence; the direct-load output becomes authoritative when
+  it contains the pipe-table rows. Generate `{case}_tasks.html` with `gen_tasks_full_html.ps1`
+  and the overall Table 2/3 fragments with `emit_tasks_tables_html.ps1`.
+5. **SQL execution threads** — normally derive exec mains and parallel children from the
+  authoritative `Tasks.Enumerate` rows. **Only when `Tasks.Enumerate` is unavailable/null**
+  (for example 0 rows from a filtered minidump), fall back to 第一步 `!mex.us` and use the
+  skill-defined stack rules to build the sweep input:
+  `extract_exec_sweep_threads_from_us.ps1 -UsTxt {case}_us.txt -OutThreads {case}_exec_sweep_threads.txt -OutJson {case}_exec_sweep_threads.json`.
+  The fallback extractor marks MAIN threads whose stack matches `sqllang!process_request`,
+  `CSQLSource::Execute`, or `sqllang!process_commands/process_commands_internal`, and CHILD
+  threads whose stack matches the parallel-worker rule (`sqlmin!SubprocEntrypoint` / CX* exchange
+  frames) without a main marker. Use the resulting comma-separated `TID:ROLE` list as
+  `-Threads` for `gen_task_sweep.ps1 -Script task.js -Run ...`; parse with
+  `parse_task_fields.ps1`. Then run `gen_task_sweep.ps1 -Script tsqlstack.js` over the parsed
+  MAIN tids from `task_fields.json`. Retry unfinished threads with `-ShardSize 1` or
+  `-RunPerThread`; keep `DSCRIPT_SHARD_TIMEOUT` / COM read-fault blocks as evidence. Parse with
+  `parse_tsqlstack.ps1 -Log ... -Out ...`, then build `build_sql_exec_manifest.ps1` ->
+  `gen_sql_exec_html.ps1`. A stack-signature HTML/list is diagnostic only; it is not a substitute
+  for running `task.js` and `tsqlstack.js` on the selected fallback thread list.
+6. **Bounded single DScript supplements** — run `run_dscript_once.ps1` for
+  `sys.schedulers.js`, `sys.dm_os_memory_brokers.js`, and `dump_latch_contended_pages.js`, each
+  with an explicit `-EndMarker`. Marker reached + cdb stuck at prompt is success; kill only the
+  idle prompt and keep the log.
+7. **Ring buffers / raw evidence** — run `run_windbgcs_direct.ps1` for build-matched mirror
+  expressions when automatic init cannot adapt. Then call the single finalizer
+  `finalize_ringbuf_reports.ps1`; it auto-splits combined direct logs into
+  `txt_detail\{case}_{expr}.txt`, runs `build_ringbuf_reports.ps1`, regenerates the MAIN report,
+  and runs the verifier. The MAIN report must show each expression as a categorized section with
+  `top 20` + rule-based anomaly rows; `direct_mirror.html` / raw txt is evidence only, not the
+  user-facing result.
+8. **Final assembly / gate** — run `gen_overall_report.ps1 -Ledger ...`, then
+  `verify_case_deliverables.ps1 -Stage Completion` with the required checks for thread
+  categories, SQL exec, scheduler inventory, and the fixed report set. PASS is the completion
+  definition; report existence alone is not.
 
 > ⛔ **Gate discipline (验证过的行为):** In **PRIMARY mode** P2 does not fire — the task list
 > comes from DumpViewer. In **FALLBACK mode** P2 is the only gate where you emit a paste-ready
@@ -183,181 +227,25 @@ srv*C:\Symbols*https://symweb.azurefd.net
 
 ---
 
-## Step 0: Pre-Check — verify tooling installation (RUN FIRST)
+## Step 0 & Step 1 (setup) → `reference/setup.md`
 
-The overall pass is **DumpViewer-first**. The PRIMARY tool is **`DumpViewer.exe`** (produces
-`dumpviewer_out\Reports\*` for 第一/二步 + most of the 附加步骤). The SUPPLEMENT/FALLBACK tools are:
-the **DScript `.js` scripts** (第三步 `task.js`/`tsqlstack.js` — always needed; plus the full
-FALLBACK pipeline), **`mex.dll`** (FALLBACK 第一步 thread inventory), and — for the FALLBACK
-`Tasks.Enumerate` view + the 4 missing rings — the **Mirrors/WinDbgCs** engine via
-**`WinDbgCsExt`** (manual WinDbg GUI) or **`SqlScriptRepl.exe`** (automated, headless). Detect/
-obtain them up front; if a required one is **missing, STOP and prompt the user**.
+> **All setup — Symbol Path · Step 0 Pre-Check (tool inventory + install prompts) · Step 1
+> Session Setup (cdb resolution + DScript COM registration + Path A/B) · Step 1 fallback
+> (mirror-404 build-share load) — is single-sourced in
+> [`reference/setup.md`](reference/setup.md).** This file lives INSIDE this skill, so
+> `dump-overall` is self-contained whether it runs standalone or is invoked by the
+> `dump-analysis` agent. Run it FIRST (respecting the P1 pause gate in the Canonical Run
+> Order above), then continue with 分析第零步 below.
 
-> **⛔ ASK THE USER FOR THE TOOL PATHS FIRST — these are machine-specific and differ on
-> every box, so NEVER auto-guess or hardcode them.** Collect: **`{dumpviewer_path}`
-> (DumpViewer.exe folder, default `C:\Users\lduan\tools\DumpViewer`), `{dscript_path}`
-> (DScript `.js` folder), and — for FALLBACK — `{mex_path}` (mex.dll folder), `{wdbgcs}`
-> (WinDbgCsExt folder), plus `{dump_path}`**. The candidate lists below are only suggested
-> defaults — the user's answer wins.
-
-| Surface | Provided by | Used for | If missing |
-|---------|-------------|----------|------------|
-| **DumpViewer.exe** (self-hosted, no cdb) | user folder `{dumpviewer_path}` (default `C:\Users\lduan\tools\DumpViewer`) | **PRIMARY** — 第一/二步 + most of the 附加步骤 (run first via `run_dumpviewer.ps1`) | **ASK the user** for the folder; if truly unavailable, run in FALLBACK mode (full DScript/mirror pipeline) |
-| **DScript `.js`** (`!dscript.run`) | user folder `{dscript_path}` (build-specific) | 第三步 `task.js` / `tsqlstack.js` (**always**) + FALLBACK 第二步 | **ASK the user** for the folder; without it 第三步 can't run |
-| **mex.dll** (`.load`, `!mex.us`) | user folder `{mex_path}` | **FALLBACK** 第一步 thread inventory — headless in cdb | **ASK the user** for the folder (FALLBACK only); PRIMARY mode does not need it |
-| **WinDbgCsExt** (`.load` into the WinDbg GUI) | NuGet `WinDbgCs.amd64` (`WinDbgCsExt.dll`) | FALLBACK `Tasks.Enumerate` mirror + the 4 missing rings — **run MANUALLY in the WinDbg GUI** | **ASK the user** for the folder (default `C:\Tools\WinDbgCs` = v3.2.7 for SQL 2019); still emit a manual WinDbg block |
-| **SqlScriptRepl** (self-hosted, no cdb) | built `SqlScriptRepl.exe` | The **automated** FALLBACK `Tasks.Enumerate` mirror path | Prompt to build (below) — optional |
-
-> **These are NOT interchangeable and NEITHER lives inside the other.** WinDbgCsExt is a
-> dbgeng **extension**; DumpViewer / SqlScriptRepl are **standalone self-hosting apps** — keep
-> each in its own self-contained folder (do NOT copy one into the other).
-
-### Pre-Check script
-
-⛔ **No ad-hoc pre-check code.** After the P1 pause (you've collected `{dump_path}`,
-`{dumpviewer_path}`, `{dscript_path}`, and — for FALLBACK — `{mex_path}`, `{wdbgcs}` from the
-user), run the committed verifier — it checks every required surface is `OK` and exits
-non-zero if anything is missing:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\pre_check.ps1 `
-  -DumpPath    '{dump_path}' `
-  -DumpViewer  '{dumpviewer_path}' `        # PRIMARY — DumpViewer.exe folder (default C:\Users\lduan\tools\DumpViewer)
-  -MexPath     '{mex_path}' `               # FALLBACK 第一步 only
-  -DscriptPath '{dscript_path}' `           # 第三步 (always) + FALLBACK
-  -Wdbgcs      '{wdbgcs}'                    # FALLBACK 第二步 + the 4 missing rings
-```
-
-Each line reports `<surface> : OK (<path>)` or `<surface> : MISSING (<expected file>) — ASK USER`.
-DumpViewer.exe (PRIMARY) + DScript `.js` (第三步) must be `OK`. `mex.dll` / WinDbgCsExt are only
-required if DumpViewer fails and the run enters FALLBACK mode.
-
-- **DumpViewer MISSING** → go back to P1 and ASK the user for the folder. If truly unavailable,
-  run in FALLBACK mode (the full DScript/mirror pipeline).
-- **DScript MISSING** → go back to P1 and ASK; without `{dscript_path}` 第三步 can't run.
-- **DumpViewer INSTALLED but SqlScriptRepl NOT BUILT** → build it (only if you want the
-  automated FALLBACK `Tasks.Enumerate`):
-  ```powershell
-  powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\build_sqlscriptrepl.ps1
-  ```
-- **WinDbgCsExt MISSING** → `Tasks.Enumerate` mirror can't run automatically; you can still
-  do the `!mex.us` stack-inferred view (1.5.1–1.5.4) and recover TaskState via the
-  **dump-analysis** skill's native-walking methods (Part 2 Method 1).
-
----
-
-## Step 1: Session Setup
-
-### Path A — cdb.exe CLI (automated, headless-safe)
-
-⛔ **No ad-hoc command generation.** Path A is a single committed script call — it resolves
-`cdb.exe` (Windows Kits **or** WinDbg Store/MSIX at `C:\Program Files\WindowsApps\Microsoft.WinDbg*\amd64\cdb.exe`),
-writes the headless-safe batch (`.sympath` symweb → `.reload /f` → `vertarget` → `lmvm sqlservr`
-→ `.load mex.dll` → `.logopen <case>_us.txt` → `!mex.us` → `.logclose` → `q`), runs cdb, and
-verifies both `<case>_us.txt` and `<case>_dump_output.txt` are written:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\run_mex_us.ps1 `
-  -Dump    '{dump_path}' `
-  -MexPath '{mex_path}' `
-  -OutDir  'reports/{case_id}_dump_code_analysis' `
-  -CaseId  '{case_id}'
-```
-
-**DScript COM registration (before any `!dscript.run`)** — the Store WinDbg package version
-changes on every auto-update, so register the 4 DScript CLSIDs per-user (HKCU):
-
-```powershell
-pwsh -NoProfile -File .github\skills\dump-overall\scripts\register_dscript.ps1
-```
-
-Otherwise `!dscript.run` fails with `not registered as a COM server`. NEVER hardcode the
-package version. **NEVER `.load WinDbgCsExt.dll` / `!dcs_initsymsvr` in the SAME session you
-run `!dscript.run`** — it poisons DScript (see «DScript operational rules» below).
-
-> **Timeout**: `run_mex_us.ps1 -TimeoutSec 300` (default) allows up to 5 minutes for large
-> dumps. The final `q` inside the batch exits cdb.exe.
->
-> The headless cdb batch for 第一步 (`!mex.us` thread inventory) is **headless-safe**; the
-> `Tasks.Enumerate` mirror is NOT (see 1.5.5).
-
-### Path B — WinDbg GUI (manual, for the mirror `Tasks.Enumerate`)
-
-> **⚠ SQL 2022 / 2025 dumps — use `!dcs_initsymsvr`, NOT `!execute <path>\SqlCsScripts.dll`**
->
-> `!execute <full-path-to-SqlCsScripts.dll>` triggers WinDbgCsExt v3.2.7's **in-process
-> Roslyn CodeGen** to build a per-dump `SqlDebugTypes.dll` (writes DIA-exported source
-> ~100–200 MB to `<dump>\output\SqlDebugTypes.exported.cs`, then compiles). On SQL 2022 /
-> 2025 dumps this often fails silently as `Codegen failed with exception` with a misleading
-> downstream `File.Move ... Could not find file '<dump>\output\SqlDebugTypes.dll'` at
-> `CodeGenHelper.cs Line 861`.
->
-> The **designed entry point** is `!dcs_initsymsvr`, which downloads `SqlCsScripts`,
-> `SqlDebugTypes`, `CsDebugScript.{Common,DiaHelpers,Engine,UI}`, `DbgEngManaged`, and
-> `SqlCsScripts.SymSvrManifest` from `srv*C:\Symbols*https://symweb.azurefd.net` via
-> `SymFindFileInPathW` — completely BYPASSING CodeGen. This works for SQL 2019 / 2022 / 2025.
->
-> `.reload /f sbs.dll` failing with `was not found in the image list` is HARMLESS —
-> sbs.dll isn't loaded in every SQL process. A handful of `InvalidMemoryAddressException`
-> rows on a filtered minidump are also benign (uncaptured `SEListElem.m_next` pages).
-
-```windbg
-* open dump:  windbgx -z {dump_path}
-.sympath+ srv*C:\Symbols*https://symweb.azurefd.net
-.load {wdbgcs}\WinDbgCsExt.dll
-!dcs_initsymsvr ;                            * downloads all CsScripts assemblies from sym server (bypasses CodeGen)
-.reload /f sqlos.dll ;
-.reload /f sqldk.dll ;
-.reload /f sqlmin.dll ;
-.reload /f sqllang.dll ;
-.reload /f qds.dll ;
-.reload /f sqlTsEs.dll ;
-.reload /f svl.dll ;
-.reload /f sbs.dll ;                         * harmless if not loaded in this dump
-.reload /f sqlvdi.dll ;
-.reload /f sqlservr.exe ;
-.reload /f hkengine.dll ;
-.reload /f hkruntime.dll ;
-.reload /f hkcompile.dll ;
-.reload /f kernel32.dll ;
-.reload /f ntdll.dll ;
-.reload /f kernelbase.dll ;
-!execute ;                                   * (no arg) lists installed scripts — verifies extension is live
-!execute ExternalScripts.Install ;           * register the SqlCsScripts helpers
-.ecxr ;                                      * exception context record (dump trigger)
-kc ;                                         * clean call stack of the faulting thread
-!execute Tasks.Enumerate                     * authoritative task-level state (SUSPENDED/RUNNABLE/RUNNING/DONE)
-```
-
-### Step 1 (fallback): `!dcs_initsymsvr` 404 — load Mirrors manually from the build share
-
-`!dcs_initsymsvr sqlservr` pulls the build-matched **mirror** pair via a symbol-server
-SymSvrManifest. If that manifest was never published (e.g. SQL 2019 CU20), the fetch 404s.
-
-1. Get the exact build: `lmDvm sqlservr` (e.g. `15.0.4312.2`).
-2. **AUTO-COPY** the mirror pair from the released-build share **into
-   `{wdbgcs}\NetStandard20Refs`** (the ext folder — NOT the dump folder). The agent runs the
-   committed script; never hand manual `copy` to the user, and never write inline PowerShell:
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\acquire_mirrors.ps1 `
-     -Wdbgcs  '{wdbgcs}' `
-     -Build   '15.0.4312.2'    # from `lmDvm sqlservr` — RESOLVE, don't guess
-     # -Product SQLServer2019  # default; override for SQL 2016/2017/2022
-   ```
-   The script exits `0` iff both `SqlCsScripts.dll` and `SqlDebugTypes.dll` are present in
-   `{wdbgcs}\NetStandard20Refs` afterwards (prints the pair as `True True`).
-3. In a **dedicated** WinDbg session (do NOT mix with DScript), `.load {wdbgcs}\WinDbgCsExt.dll`,
-   then `!execute {wdbgcs}\NetStandard20Refs\SqlCsScripts.dll` (register — session-scoped,
-   lost on every restart), then `!execute Tasks.Enumerate`.
-
-**Gotchas:**
-- `The type initializer for 'SqlDebugTypes.NodeManager' threw an exception` = DLLs from a
-  **different build** than the dump. Re-verify `lmDvm sqlservr` and re-copy.
-- **EVERY row = `Missing from SqlDebugTypes`** = the loaded **WinDbgCsExt is too new** for
-  the mirror pair. On this box the 2023-04 pair works with `C:\Tools\WinDbgCs\` (**v3.2.7**)
-  but NOT `C:\Tools\WinDbgCs.amd64\` (**v4.11.0**). For SQL 2019 dumps prefer v3.2.7. A
-  *few* `InvalidMemoryAddressException` rows on a **minidump** = uncaptured pages = benign.
-- This only fixes the 404 — it does NOT recover pages missing from a minidump.
+> **This skill is DumpViewer-FIRST (PRIMARY).** In setup, the surface that matters here is
+> **`DumpViewer.exe`** (`{dumpviewer_path}`, default `C:\Users\lduan\tools\DumpViewer`) for
+> 分析第零步 + 第一/二步 + most 附加步骤, plus **DScript `.js`** (`{dscript_path}`) for 第三步.
+> The **mex.dll / WinDbgCsExt / SqlScriptRepl** surfaces in setup.md are **FALLBACK-only**
+> (used only if DumpViewer can't run and the pass enters FALLBACK mode). Committed helper
+> scripts live under `.github/skills/dump-overall/scripts/` (`pre_check.ps1`,
+> `run_mex_us.ps1`, `register_dscript.ps1`, `acquire_mirrors.ps1`,
+> `run_windbgcs_direct.ps1`, `split_direct_mirror_log.ps1`, `finalize_ringbuf_reports.ps1`,
+> `build_sqlscriptrepl.ps1`) — setup.md points at them.
 
 ---
 
@@ -521,6 +409,13 @@ Monitor / Parallel / Busy / NonYield）。一个线程可同时命中多个桶(�
 - **内联规则(两种模式通用):** 第一步**只内联「命中功能桶」的线程**的完整调用栈(按功能分类分组,
   锚点 `id='thr-<桶key>-<tid>'`,表 2 的线程 ID chip 跳转至此);**其余常规/空闲线程不展开**
   (332 线程里通常只有几十个命中桶),保持报告精简。表 1 仍为全量 worker-state 汇总。
+
+- **强制产物 / hard gate:** 生成 `thread_categories.json` 后必须立刻运行
+  `gen_thread_categories_html.ps1 -UsTxt {case}_us.txt -Out {case}_thread_categories.html -CaseId {case_id}`。
+  主报告的「线程功能分类」摘要表必须链接到 `{case}_thread_categories.html`，并至少包含
+  `#cat-iocp` / `#cat-lat` / `#cat-mon` / `#cat-par` 这些功能桶锚点。完成前运行
+  `verify_case_deliverables.ps1 -Stage Completion`；只要 `thread_categories.json` 存在，verifier 会
+  强制检查明细 HTML、功能桶锚点、`<details>` stack blocks 以及主报告链接。没有这个明细页不得交付。
 
 ### 1.5.1 Capture every thread's stack with mex (to a log file)
 
@@ -918,6 +813,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\
   -Run -Dump '{dump_path}'
 ```
 
+**Canonical bounded run for large main+child sweeps (recommended):** use the same script with
+`-ShardSize` / `-ShardTimeoutSec`. This is the stable path for cases with many parallel child
+threads. It writes one shard `.wds` per batch, polls each shard's `.logopen` file for
+`##### END TASK.JS SHARD <n> #####`, kills cdb if it is merely sitting at the prompt after the
+marker, and merges all shard logs into `{case_id}_task_all.txt`.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\gen_task_sweep.ps1 `
+  -Threads '<main1>:MAIN,<child1>:CHILD,<child2>:CHILD,...' `
+  -DscriptPath '{dscript_path}' `
+  -LogFile 'reports/{case_id}_dump_code_analysis/{case_id}_task_all.txt' `
+  -OutWds  'reports/{case_id}_dump_code_analysis/{case_id}_task_all.wds' `
+  -Script task.js `
+  -Run -ShardSize 10 -ShardTimeoutSec 300 `
+  -Dump '{dump_path}' -SymPath '{sym_path}' -Cdb '{cdb_path}'
+```
+
+> **Why this exists:** cdb/DScript often completes the script and reaches the shard end marker
+> but then stays at the debugger prompt instead of exiting. Older raw `& cdb ...` calls look
+> like a hang. The bounded shard mode treats the end marker as success, kills only the prompt,
+> and continues. If a shard never reaches the marker, it appends `DSCRIPT_SHARD_TIMEOUT` evidence
+> and continues with later shards. Do not replace this with an unbounded one-shot cdb call.
+
 > Under the hood it runs the proven line (register DScript COM first via
 > `scripts\register_dscript.ps1` if `!dscript.run` errors `not registered as a COM server`):
 > ```powershell
@@ -974,10 +892,18 @@ SPID**; emit `{ main, childCount, children[] }` per main.
 
 > ✅ **Use the skill-local parser — do NOT hand-roll it:**
 > ```powershell
-> powershell -File .github\skills\dump-overall\scripts\parse_task_fields.ps1 -CaseId '{case_id}'
+> powershell -NoProfile -ExecutionPolicy Bypass `
+>   -File .github\skills\dump-overall\scripts\parse_task_fields.ps1 `
+>   -CaseId '{case_id}' `
+>   -Dir 'reports/{case_id}_dump_code_analysis' `
+>   -TaskAll 'reports/{case_id}_dump_code_analysis/{case_id}_task_all.txt'
 > ```
 > It writes `task_fields.json` = one `{ main, childCount, children[] }` object per exec main.
 > `childCount` feeds the 子线程数 column (1.7.5) and the `主 · N 子` / `↳ tid` runtime rows.
+
+> **Completion gate:** `{case_id}_task_all.txt` must contain one `===TASK_...===` block per
+> selected main/child thread and `##### END TASK.JS SWEEP #####`. A partial main-only sweep is
+> incomplete.
 
 > ⚠️ Anchor `^Elapsed time` (NOT `Quantum elapsed time`) and always anchor own-fields at `^`.
 > ⚠️ **PowerShell trap:** never name a helper `H` (or any single letter matching a built-in
@@ -994,6 +920,35 @@ powershell -File .github\skills\dump-overall\scripts\gen_task_sweep.ps1 `
   -DscriptPath '{dscript_path}' -Run -Dump '{dump_path}' `
   -LogFile 'reports/{case_id}_dump_code_analysis/{case_id}_tsqlstack.txt' `
   -OutWds  'reports/{case_id}_dump_code_analysis/{case_id}_tsqlstack.wds'
+```
+
+**Canonical bounded `tsqlstack.js` run:** start with modest shards; if a shard times out, rerun
+the unfinished mains with `-ShardSize 1` so one bad minidump read does not hide later mains.
+Keep every timeout block as evidence.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\gen_task_sweep.ps1 `
+  -Threads '<main1>:MAIN,<main2>:MAIN,...' `
+  -DscriptPath '{dscript_path}' `
+  -LogFile 'reports/{case_id}_dump_code_analysis/{case_id}_tsqlstack.txt' `
+  -OutWds  'reports/{case_id}_dump_code_analysis/{case_id}_tsqlstack.wds' `
+  -Script tsqlstack.js `
+  -Run -ShardSize 4 -ShardTimeoutSec 420 `
+  -Dump '{dump_path}' -SymPath '{sym_path}' -Cdb '{cdb_path}'
+```
+
+If a shard stalls before its end marker, preserve the completed shard log, then rerun the
+remaining tids one per shard:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\gen_task_sweep.ps1 `
+  -Threads '<remaining_main>:MAIN,...' `
+  -DscriptPath '{dscript_path}' `
+  -LogFile 'reports/{case_id}_dump_code_analysis/{case_id}_tsqlstack_rest.txt' `
+  -OutWds  'reports/{case_id}_dump_code_analysis/{case_id}_tsqlstack_rest.wds' `
+  -Script tsqlstack.js `
+  -Run -ShardSize 1 -ShardTimeoutSec 120 `
+  -Dump '{dump_path}' -SymPath '{sym_path}' -Cdb '{cdb_path}'
 ```
 
 `tsqlstack.js` is slow (~5 min headless per batch — wait for the `===..._DONE===` / `ALL_DONE`
@@ -1026,8 +981,11 @@ are N mains is INCOMPLETE** — every main needs its own decoded statement (or a
 powershell -NoProfile -ExecutionPolicy Bypass `
   -File .github\skills\dump-overall\scripts\parse_tsqlstack.ps1 `
   -Log 'reports/{case_id}_dump_code_analysis/{case_id}_tsqlstack.txt' `
-  -Out 'reports/{case_id}_dump_code_analysis/tsqlstack_fields.json'
+  -Out 'reports/{case_id}_dump_code_analysis/{case_id}_tsqlstack.json'
 ```
+
+> **Completion gate:** `{case_id}_tsqlstack.json` must contain one entry per exec main. OK,
+> COM partial, and `DSCRIPT_SHARD_TIMEOUT` are all valid evidence states; a missing block is not.
 
 #### 1.7.4b Extract the parallel-child call stacks (InParallelThreads sidecar)
 
@@ -1058,9 +1016,18 @@ line, `tsqlstack` output (raw text, will be HTML-escaped + wrapped in `<pre>`), 
 stack — then run:
 
 ```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\build_sql_exec_manifest.ps1 `
+  -CaseId '{case_id}' `
+  -Dir 'reports/{case_id}_dump_code_analysis' `
+  -TaskFields 'reports/{case_id}_dump_code_analysis/task_fields.json' `
+  -TsqlStackJson 'reports/{case_id}_dump_code_analysis/{case_id}_tsqlstack.json' `
+  -ThreadsJson 'reports/{case_id}_dump_code_analysis/threads_from_us.json' `
+  -Out 'reports/{case_id}_dump_code_analysis/{case_id}_sql_exec_manifest.json' `
+  -BackLink '{case_id}_overall_report.html'
+
 powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\gen_sql_exec_html.ps1 `
-  -Manifest 'reports/{case_id}_dump_overall/{case_id}_sql_exec_manifest.json' `
-  -Out      'reports/{case_id}_dump_overall/{case_id}_sql_exec_thread.html'
+  -Manifest 'reports/{case_id}_dump_code_analysis/{case_id}_sql_exec_manifest.json' `
+  -Out      'reports/{case_id}_dump_code_analysis/{case_id}_sql_exec_thread.html'
 ```
 
 Manifest schema (cards / verdict / sections[] / threads[] with `tid`, `cardCls`, `statusTag`,
@@ -1091,6 +1058,10 @@ script header.
 > `childCount > 0`, sections 2 and 3 MUST list those children (source them from the
 > `===TASK_<tid> CHILD===` blocks in `{case}_task_all.txt`). Reference layout:
 > `2606250030005483_dump_overall\2606250030005483_sql_exec_thread.html`.
+
+> **Completion gate:** `{case_id}_sql_exec_thread.html` must contain all three section labels:
+> `执行语句主线程`, `并行子线程`, and `主线程 / 子线程运行时状态明细`, and the main overall report must
+> link to it.
 
 ### 1.7.5 Build the two report tables
 
@@ -1137,6 +1108,19 @@ worker 独占 scheduler），但本 skill **只客观列举，不下根因结论
 !dscript.run C:\Tools\dscript\sql2022\scripts\scripts\sys.schedulers.js
 ```
 
+For SQL2022-before dumps (or mirror fallback), run the DScript path with the bounded single-script
+runner. Do not run a naked `& cdb ...` command, because cdb may execute the script and then sit at
+the prompt forever.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\run_dscript_once.ps1 `
+  -ScriptPath '{dscript_path}\sys.schedulers.js' `
+  -LogFile 'reports/{case_id}_dump_code_analysis/{case_id}_sys.schedulers.txt' `
+  -OutWds  'reports/{case_id}_dump_code_analysis/{case_id}_sys.schedulers.wds' `
+  -Dump '{dump_path}' -SymPath '{sym_path}' -Cdb '{cdb_path}' `
+  -EndMarker 'END SYS.SCHEDULERS' -TimeoutSec 300
+```
+
 > ⚠️ **mirror / DScript 路径都按 dump 的 build 选择。** `!execute Schedulers.Enumerate` 的 mirror 对必须与
 > dump 的 build 匹配（`True True`）；fallback 的 `sql2022` 是**版本专属**目录——必须与 dump 的产品主版本
 > 匹配（2019/2022/2025 各自的 `sys.schedulers.js`），否则符号偏移不对。DScript 与第三步 `task.js`/`tsqlstack.js`
@@ -1151,6 +1135,9 @@ worker 独占 scheduler），但本 skill **只客观列举，不下根因结论
 :: fallback 到 DScript（或 SQL2022 之前）时
 {case}_dump_overall\txt_detail\{case}_sys.schedulers.txt
 ```
+
+> **Completion gate:** the scheduler inventory raw file must be non-empty. For the DScript path,
+> `{case_id}_sys.schedulers.txt` must contain `END SYS.SCHEDULERS`.
 
 > 采集方式：`!execute Schedulers.Enumerate`（SqlScriptRepl / mirror）**或** `sys.schedulers.js`
 > （cdb `-c "$$><file; q"` / SqlScriptRepl `!dscript.run`）。两者列的语义等价（≈ `sys.dm_os_schedulers`）。
@@ -1316,6 +1303,26 @@ agents (dump-analysis 第三步/附加步骤) can re-parse the same raw captures
 carry-forward captures here for downstream reuse: `{case}_us.txt`, `{case}_tasks_output.txt`,
 `repl_stdout_<ts>.txt`, `{case}_task_all.txt`, `{case}_tsqlstack.txt`.
 
+When the acquisition path is `run_windbgcs_direct.ps1`, its output is one combined log with
+`== MARKER_<expr> ==` fences. **Do not link that combined log, or a `direct_mirror.html` wrapper
+around it, as the ring-buffer result.** Run the committed finalizer; it performs split → build →
+verify in one call:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\finalize_ringbuf_reports.ps1 `
+  -Dir    'reports/{case_id}_dump_overall' `
+  -CaseId '{case_id}' `
+  -TopN   20 `
+  -RequireThreadCategories `
+  -RequireSqlExec `
+  -RequireSchedulerInventory
+```
+
+The raw direct log may still be linked as evidence, but the MAIN report's 附加步骤 must be the
+parsed/classified view: category histogram, dump-before top 20 rows, rule-based anomaly rows,
+and one paginated sub-report per expression. `split_direct_mirror_log.ps1` and
+`build_ringbuf_reports.ps1` remain available for debugging, but normal runs use the finalizer.
+
 ### Build the 附加步骤 section (committed script)
 
 ⛔ **No ad-hoc parser / HTML.** Run the committed builder. It parses the 9 `txt_detail\`
@@ -1336,6 +1343,10 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\script
 > the sibling `gen_overall_report.ps1` (`$PSScriptRoot`). It is **idempotent** — re-running
 > removes any prior `附加步骤 · SOS 环形缓冲*` section before re-inserting, and inserts the
 > section immediately **before** the DoD section, adding a `环形缓冲命令 = 9 条 · 见附加步骤` card.
+
+> ⛔ **Direct mirror completion gate:** if `run_windbgcs_direct.ps1` produced any ring-buffer
+> rows, `finalize_ringbuf_reports.ps1` must finish successfully. A report that only links
+> `direct_mirror.html` / raw txt is incomplete even if the direct mirror command itself succeeded.
 
 For **each** of the 9 sections the MAIN report shows:
 
@@ -1413,6 +1424,64 @@ symbols** — they do **NOT** use the WinDbgCs / Mirrors mechanism. Hard-won rul
 
 ## Output — the Overall Snapshot report
 
+### Hard workflow ledger + completion verifier
+
+⛔ **Final report generation is not the completion gate.** The workflow must maintain a
+`workflow_ledger.json` from the beginning of the run and must pass the committed completion
+verifier before the agent may say the task is complete. This prevents both failure modes:
+
+- an incomplete `<case>_overall_report.html` generated from a partial manifest;
+- no `<case>_overall_report.html` generated at all.
+
+The ledger has two top-level groups:
+
+```json
+{
+  "requiredSteps": {
+    "P3_dscript_exec": {
+      "required": true,
+      "status": "missing",
+      "artifacts": ["<case>_task_all.txt", "task_fields.json", "<case>_sql_exec_thread.html"]
+    }
+  },
+  "requiredDeliverables": {
+    "overall_html": {
+      "required": true,
+      "stage": "Completion",
+      "status": "missing",
+      "path": "<case>_overall_report.html"
+    }
+  }
+}
+```
+
+Allowed terminal statuses are only `done`, `unavailable-with-evidence`, and
+`skipped-by-user`. `missing`, `not_run`, `blocked`, or `failed` blocks final completion.
+`unavailable-with-evidence` is valid only when the ledger item also lists non-empty raw
+failure logs in `evidence[]`.
+
+Before writing the main report, pass the ledger to the generator so required pre-report steps
+cannot be silently omitted:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\gen_overall_report.ps1 `
+  -Manifest 'reports/{case_id}_dump_overall/{case_id}_manifest.json' `
+  -Out      'reports/{case_id}_dump_overall/{case_id}_overall_report.html' `
+  -Ledger   'reports/{case_id}_dump_overall/workflow_ledger.json'
+```
+
+Before final response / `task_complete`, run the completion verifier. If it fails, the run is
+incomplete and the final response must list the missing deliverables instead of claiming
+completion:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\verify_case_deliverables.ps1 `
+  -CaseId '{case_id}' `
+  -OutDir 'reports/{case_id}_dump_overall' `
+  -Ledger 'reports/{case_id}_dump_overall/workflow_ledger.json' `
+  -Stage Completion
+```
+
 The overall pass produces a report (HTML or Markdown per user preference) with:
 
 | Section | Source | Delivers |
@@ -1453,12 +1522,14 @@ Manifest schema (cards / stats / sections[] with `title`, `pre`, `html`, `note`)
 in the script header. 纯列举 — 无 root-cause 判断。
 
 > **Report assembly is script-driven** — no ad-hoc HTML in a `.ps1` at runtime. The MAIN
-> `<case>_overall_report.html` is produced by the committed generator:
+> `<case>_overall_report.html` is produced by the committed generator, with the workflow
+> ledger passed as a hard pre-report gate:
 >
 > ```powershell
 > powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\gen_overall_report.ps1 `
 >   -Manifest 'reports/{case_id}_dump_overall/{case_id}_manifest.json' `
->   -Out      'reports/{case_id}_dump_overall/{case_id}_overall_report.html'
+>   -Out      'reports/{case_id}_dump_overall/{case_id}_overall_report.html' `
+>   -Ledger   'reports/{case_id}_dump_overall/workflow_ledger.json'
 > ```
 >
 > The generator owns the fixed CSS (**Catppuccin Mocha**) + the section skeleton (header meta
@@ -1474,6 +1545,12 @@ in the script header. 纯列举 — 无 root-cause 判断。
 
 > ⛔ **DEFINITION-OF-DONE GATE — paste this checklist and tick every box BEFORE writing the
 > report. Any unchecked / numeric-mismatch box ⇒ the overall pass is INCOMPLETE, go back:**
+> - [ ] **Workflow ledger initialized at run start** with all required steps and deliverables
+>       defaulting to `missing`; no final response / `task_complete` is allowed until
+>       `verify_case_deliverables.ps1 -Stage Completion` prints PASS.
+> - [ ] **Final deliverables are verified by script**, not by visual inspection: at minimum
+>       `<case>_overall_report.html` exists and is non-empty, and every required ledger
+>       artifact is `done`, `unavailable-with-evidence`, or `skipped-by-user`.
 > - [ ] **第零步 DumpViewer** ran first via `run_dumpviewer.ps1`; the resolved **mode** is recorded
 >       (exit `0`=PRIMARY / exit `2`=FALLBACK). PRIMARY: `dumpviewer_out\Reports\` populated and the
 >       consumed sidecars converted via `parse_dumpviewer_json.js`. FALLBACK: full DScript/mirror path used.

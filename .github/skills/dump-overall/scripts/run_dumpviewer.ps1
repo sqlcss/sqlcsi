@@ -47,8 +47,8 @@ if (-not (Test-Path $exe)) {
 }
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
 
-$dvOut   = Join-Path $OutDir 'dumpviewer_out'
-$reports = Join-Path $dvOut 'Reports'
+$dvOut     = Join-Path $OutDir 'dumpviewer_out'
+$reportDir = Join-Path $dvOut 'Reports'
 
 Write-Host "[run_dumpviewer] DumpViewer.exe : $exe"
 Write-Host "[run_dumpviewer] dump          : $Dump"
@@ -70,23 +70,23 @@ $code = $p.ExitCode
 # These four back 第一步 / 第二步; their absence means DumpViewer could not adapt
 # to this build (early 2019 CU / older) → caller must use the full DScript path.
 $key = @('ThreadDetails.html', 'UniqueStacks.html', 'Tasks.html', 'Threads.html')
-$present = @($key | Where-Object { Test-Path (Join-Path $reports $_) })
-$missing = @($key | Where-Object { -not (Test-Path (Join-Path $reports $_)) })
+$present = @($key | Where-Object { Test-Path -LiteralPath (Join-Path $reportDir $_) })
+$missing = @($key | Where-Object { -not (Test-Path -LiteralPath (Join-Path $reportDir $_)) })
 
 $reportCount = 0
-if (Test-Path $reports) {
-    $reportCount = @(Get-ChildItem $reports -Filter *.html -ErrorAction SilentlyContinue).Count
+if (Test-Path -LiteralPath $reportDir) {
+    $reportCount = @(Get-ChildItem -LiteralPath $reportDir -Filter *.html -ErrorAction SilentlyContinue).Count
 }
 
 Write-Host ("[run_dumpviewer] exit={0}  Reports\*.html={1}  key present={2}/{3}" -f `
     $code, $reportCount, $present.Count, $key.Count)
 
 if ($present.Count -eq $key.Count) {
-    Write-Host "[run_dumpviewer] SUCCESS — PRIMARY mode: build the report from dumpviewer_out\Reports data" -ForegroundColor Green
+    Write-Host "[run_dumpviewer] SUCCESS - PRIMARY mode: build the report from dumpviewer_out\Reports data" -ForegroundColor Green
     exit 0
 }
 else {
-    Write-Host ("[run_dumpviewer] FALLBACK — missing key pages: {0}" -f ($missing -join ', ')) -ForegroundColor Yellow
-    Write-Host "[run_dumpviewer] DumpViewer could not adapt to this build — use the full DScript/mirror pipeline" -ForegroundColor Yellow
+    Write-Host ("[run_dumpviewer] FALLBACK - missing key pages: {0}" -f ($missing -join ', ')) -ForegroundColor Yellow
+    Write-Host "[run_dumpviewer] DumpViewer could not adapt to this build - use the full DScript/mirror pipeline" -ForegroundColor Yellow
     exit 2
 }

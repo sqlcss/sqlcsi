@@ -1,8 +1,11 @@
 param(
   [string]$Src = 'C:\Users\lduan\sqlcsi-archive\reports\2606250030005483_dump_code_analysis\2606250030005483_us.txt',
   [string]$Out = 'C:\Users\lduan\sqlcsi-archive\reports\2606250030005483_dump_code_analysis\2606250030005483_us.html',
-  [string]$CaseId = '2606250030005483'
+  [string]$CaseId = '2606250030005483',
+  [string]$BackLink = ''
 )
+
+if (-not $BackLink) { $BackLink = "${CaseId}_overall_report.html" }
 
 $lines = Get-Content $Src
 $groups=@(); $cur=$null
@@ -93,7 +96,7 @@ pre .mod{color:var(--mauve);}
 </style></head><body>
 <header><div class="container">
 <h1>线程清单 — 全部 $total 个线程</h1>
-<div class="sub">Case <b>$CaseId</b> · SQLDump0001.mdmp · <code>!mex.us</code> 输出 · $($groups.Count) 个唯一调用栈 · <a href="2606250030005483_report.html">&larr; 返回主报告</a></div>
+<div class="sub">Case <b>$CaseId</b> · <code>!mex.us</code> 输出 · $($groups.Count) 个唯一调用栈 · <a href="$(HE $BackLink)">&larr; 返回主报告</a></div>
 </div></header>
 <div class="container">
 "@)

@@ -91,6 +91,7 @@ function Parse-Block {
         parameters           = @()
         locals               = @()
         comError             = $null
+        timeout              = $null
         rawBefore            = $null
         rawAll               = ($body -join "`r`n")
     }
@@ -150,6 +151,13 @@ function Parse-Block {
             $errLine = [int]$Matches[1]
             continue
         }
+        if ($ln -match '^DSCRIPT_(?:SHARD_)?TIMEOUT\s+script=([^\s]+)\s+timeoutSec=(\d+)') {
+            $r.timeout = [ordered]@{
+                script = $Matches[1]
+                timeoutSec = [int]$Matches[2]
+            }
+            continue
+        }
     }
 
     if ($sawErr) {
@@ -163,7 +171,10 @@ function Parse-Block {
     # rawBefore = trimmed, blank-lines collapsed, script banners removed.
     $clean = @($preErr) | Where-Object { $_ -notmatch '^\s*-{5,}\s*$' -and $_ -notmatch '^-{3,}\s*Script (Starting|Complete)\s*-{3,}\s*$' }
     # Trim trailing blank lines
-    while ($clean.Count -gt 0 -and [string]::IsNullOrWhiteSpace($clean[-1])) { $clean = $clean[0..($clean.Count-2)] }
+    while ($clean.Count -gt 0 -and [string]::IsNullOrWhiteSpace($clean[-1])) {
+        if ($clean.Count -eq 1) { $clean = @(); break }
+        $clean = $clean[0..($clean.Count-2)]
+    }
     $r.rawBefore = ($clean -join "`r`n").TrimEnd()
 
     return $r
@@ -181,11 +192,12 @@ $outDir = Split-Path -Parent $Out
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
 [System.IO.File]::WriteAllText($Out, $json, (New-Object System.Text.UTF8Encoding($false)))
 
-$okCount   = ($threads | Where-Object { -not $_.comError }).Count
+$okCount   = ($threads | Where-Object { -not $_.comError -and -not $_.timeout }).Count
 $partCount = ($threads | Where-Object {      $_.comError }).Count
-Write-Host "[parse_tsqlstack] threads=$($threads.Count)  ok=$okCount  partial(COM 0x80020101)=$partCount  -> $Out"
+$timeoutCount = ($threads | Where-Object { $_.timeout }).Count
+Write-Host "[parse_tsqlstack] threads=$($threads.Count)  ok=$okCount  partial(COM 0x80020101)=$partCount  timeout=$timeoutCount  -> $Out"
 foreach ($t in $threads) {
-    $tag = if ($t.comError) { "PARTIAL($($t.comError.code)@VA=$($t.comError.virtualAddress))" } else { 'OK' }
+    $tag = if ($t.timeout) { "TIMEOUT($($t.timeout.timeoutSec)s)" } elseif ($t.comError) { "PARTIAL($($t.comError.code)@VA=$($t.comError.virtualAddress))" } else { 'OK' }
     Write-Host ("  tid={0,-6} role={1,-6} proc={2,-40} nest={3} stmt#={4} class={5} {6}" -f `
         $t.tid, $t.role, $t.procedure, $t.nestLevel, $t.statementIndex, $t.statementClass, $tag)
 }

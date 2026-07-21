@@ -10,17 +10,6 @@ context: fork
 
 # Dump Analysis Skill
 
-## Symbol Server Path (ALWAYS USE THIS)
-
-For every cdb/WinDbg session in this skill, use this symbol path:
-
-```
-srv*C:\Symbols*https://symweb.azurefd.net
-```
-
-- Set it at launch (`-y "srv*C:\Symbols*https://symweb.azurefd.net"`) or via `.sympath srv*C:\Symbols*https://symweb.azurefd.net` before `.reload`.
-- `C:\Symbols` is the local downstream cache; private PDBs (sqllang/sqlmin/sqltses) get cached there and `.reload /f` loads them instantly.
-
 ## Overview
 
 This skill analyzes SQL Server crash dumps using two execution paths:
@@ -51,7 +40,7 @@ IF dump_path is provided AND cdb.exe is reachable:
 ELSE IF user says "generate commands" or "WinDbg":
   → Path B (WinDbg GUI)
 ELSE IF user pastes WinDbg output:
-  → 分析第四步 (Parse & Compile Findings) directly
+  → 深挖第二步 (Parse & Compile Findings) directly
 ELSE:
   → Ask user which path to use
 ```
@@ -81,34 +70,14 @@ ELSE:
 
 ---
 
-## Symbol Path (read this FIRST — do NOT hardcode msdl)
+## Setup & tooling contract → see `../dump-overall/reference/setup.md`
 
-**Always use the machine's configured symbol path** — on this workstation it is the
-User environment variable `_NT_SYMBOL_PATH`:
-
-```
-srv*C:\Symbols*https://symweb.azurefd.net
-```
-
-- `symweb.azurefd.net` is the **internal** symbol server — it has SQL private PDBs
-  **and** the SqlCsScripts/Mirrors packages. The public `msdl.microsoft.com` has
-  neither the mirrors nor (reliably) SQL private symbols, so **do not hardcode
-  `https://msdl.microsoft.com/download/symbols`** in scripts.
-- In a `.cdb` script use `.sympath` with the value from `_NT_SYMBOL_PATH`, e.g.
-  `.sympath srv*C:\Symbols*https://symweb.azurefd.net`. Using `.symfix` is fine
-  **only** if the machine default already points at symweb; prefer reading the env
-  var so the path is correct everywhere.
-- **sympath ordering rule**: an HTTP store must be the LAST store, and there can be
-  only ONE HTTP store. `srv*C:\Symbols*https://symweb...*https://msdl...` fails with
-  `SYMSRV: Any HTTP store must be the last store in the list`. Keep symweb last/alone.
-- Resolve it at runtime:
-  ```powershell
-  $sym = [Environment]::GetEnvironmentVariable('_NT_SYMBOL_PATH','User')
-  if (-not $sym) { $sym = 'srv*C:\Symbols*https://symweb.azurefd.net' }
-  ```
-  then emit `.sympath $sym` into the `.cdb` script.
-- VPN required for symweb. If symweb is unreachable, private symbols (and mirrors)
-  won't load — fall back to `kn` + `!analyze -v` only (Part 2 decision table).
+> **Symbol Path · Step 0 Pre-Check · Step 1 Session Setup · Step 1 fallback (mirror-404
+> build-share load) are single-sourced in [`../dump-overall/reference/setup.md`](../dump-overall/reference/setup.md).**
+> Do the setup there FIRST (this skill uses the **cdb/mirrors + DScript + `mex.dll`**
+> subset — Part 2 native walking / Part 3 DScript; it does NOT run DumpViewer as primary),
+> then walk the analysis steps below. (setup.md lives in the `dump-overall` skill so that
+> skill stays self-contained; `dump-analysis` always runs after `dump-overall`.)
 
 ---
 
@@ -124,13 +93,13 @@ the `<case>_report.html` deliverable):
 | *(header meta cards)* | Step 0–1 (setup) | dump metadata: bugcheck, build, PID, MemoryLoad, uptime, capture time |
 | **第一步：线程清单与状态统计** | → **`dump-overall`** skill | thread inventory + SQLOS worker-state (stack-inferred) + authoritative TaskState (`Tasks.Enumerate`) + per-scheduler distribution + 关键观察/下一步 |
 | **第二步：执行语句线程统计** | → **`dump-overall`** skill | main/child exec-statement threads, runtime-state (blocking-chain) table, `sql_exec_thread.html` detail page |
-| **第三步：子系统聚焦 & 深挖** | **分析第三步** (§ below) | pick the subsystem the observations point to, run its deep-dive commands |
-| *(findings / root cause)* | **分析第四步** | parse outputs, compile errors + call-stack functions + server state |
+| **深挖第一步：子系统聚焦 & 深挖** | **深挖第一步** (§ below) | pick the subsystem the observations point to, run its deep-dive commands |
+| **深挖第二步：根因** | **深挖第二步** | parse outputs, compile errors + call-stack functions + server state |
 
 > **第一步 & 第二步 have been split into the standalone `dump-overall` skill** (the
 > DumpViewer-style global snapshot: `!mex.us`, `!execute Tasks.Enumerate`, `task.js`,
 > `tsqlstack.js`). **Run `dump-overall` first**, then return here for the problem-specific
-> 分析第三步 (subsystem deep-dive) + 分析第四步 (root cause).
+> 深挖第一步 (subsystem deep-dive) + 深挖第二步 (root cause).
 
 > **Ordering rule:** never jump to a subsystem deep-dive before 分析第一步/第二步.
 > The thread inventory + state statistics decide *which* subsystem to open, and the
@@ -140,398 +109,13 @@ the `<case>_report.html` deliverable):
 
 ---
 
-## Step 0: Pre-Check — verify tooling installation (RUN FIRST, before any analysis)
+## Step 0 & Step 1 (setup) → `../dump-overall/reference/setup.md`
 
-**Four tools power this skill:** `mex.dll`, the DScript `.js` scripts, `WinDbgCsExt`,
-and `DumpViewer` (+ `SqlScriptRepl.exe`). Detect / obtain all four up front. If a
-required one is **missing, STOP and prompt the user** (install it, or provide its
-folder) — do NOT silently fall through to a broken path.
-
-> **⛔ STEP 0 = ASK THE USER FOR THE TOOL PATHS FIRST — these are machine-specific and
-> differ on every box, so NEVER auto-guess or hardcode them.** Before running anything,
-> STOP and collect from the user: **`{wdbgcs}` (WinDbgCsExt folder), `{dscript_path}`
-> (DScript `.js` folder), `{mex_path}` (mex.dll folder), and `{dump_path}` (the dump
-> file)**. The candidate lists below are only *suggested defaults* to pre-fill the
-> question — the user's answer wins. Do not proceed to 分析第一步 until all four are
-> confirmed.
-
-- **mex.dll** + **DScript `.js`** → user-provided folders (`{mex_path}`, `{dscript_path}`);
-  both run **headless in cdb** (分析第一步 thread inventory, 分析第二步 task sweep).
-- **WinDbgCsExt** → Part 1 mirrors `!execute`/`!evaluate`, run **manually in the WinDbg GUI**.
-- **DumpViewer + SqlScriptRepl** → the **automated** mirror path (self-hosted REPL).
-
-| Surface | Provided by | Used for | If missing |
-|---------|-------------|----------|------------|
-| **WinDbgCsExt** (`.load` into the **WinDbg GUI**) | NuGet `WinDbgCs.amd64` (`WinDbgCsExt.dll`) | Part 1 mirrors `!execute`/`!evaluate` — **run MANUALLY in the WinDbg GUI** (cdb `-cf`/`-c` batch is unreliable: `!dcs_initsymsvr` + `!execute` stall at the DML script-selection menu / 404 / error out) | **ASK the user for the folder** (machine-specific; default `C:\Tools\WinDbgCs` = v3.2.7 for SQL 2019); still generate a **manual WinDbg block** for the user |
-| **DumpViewer + SqlScriptRepl** (self-hosted, no cdb) | DumpViewer package + built `SqlScriptRepl.exe` | The **automated** mirror path: arbitrary `Class.Method` REPL, out-of-process CodeGen (bypasses the cdb CodeGen dynamic-dispatch failure). Uses `CsDebugScript.Engine` directly — does **not** load WinDbgCsExt | Prompt to install/build (see below) |
-| **DScript `.js` scripts** (`!dscript.run`, Part 3) | **User-provided** folder `{dscript_path}` (e.g. `C:\Tools\dscript\sql2019`) — build-specific | `task.js` / `tsqlstack.js` / `callstack.js` / `all_ios.js` — runs headless in cdb | **ASK the user for the folder** (see below); without it 分析第二步 (task sweep) can't run |
-| **mex.dll** (`.load`, `!mex.us`) | **User-provided** folder `{mex_path}` (e.g. `C:\Tools\mex`) | Thread inventory in 分析第一步 (`!mex.us`) — runs headless in cdb | **ASK the user for the folder** (see below); without it 分析第一步 (thread inventory) can't run |
-
-> **These are NOT interchangeable and NEITHER lives inside the other.** WinDbgCsExt is
-> a dbgeng **extension**; DumpViewer is a **standalone self-hosting app**. Do NOT copy
-> `DumpViewer.exe` into the `WinDbgCs.amd64` folder (or vice-versa) — DumpViewer needs
-> its OWN full sibling set (`dbgeng.dll`, `dbghelp.dll`, `CsDebugScript.Engine.dll`,
-> `ReportTemplate\`, `DumpViewerConfig.xml`) and version-matched CsDebugScript DLLs.
-> Keep each tool self-contained in its own folder.
-
-> **Batch-vs-manual rule (important):** the cdb `-cf`/`-c` **batch** surface runs ONLY
-> headless-safe commands — native DX/`dv`/`kn`/`.cxr` (Part 2), `mex` (分析第一步), and
-> DScript `!dscript.run` `.js` (Part 3). The Part 1 **mirror** commands
-> (`!dcs_initsymsvr` + `!execute`/`!evaluate`) do **not** batch reliably — for those,
-> **generate a manual WinDbg GUI block for the user** (preferred) or run
-> `SqlScriptRepl.exe`. Never assume `!execute`/`!evaluate` will work under `cdb -cf`.
-
-### Pre-Check script
-
-```powershell
-# --- WinDbgCsExt (cdb/WinDbg mirror extension) — USER-PROVIDED, machine-specific ---
-# ASK the user for {wdbgcs}. Accept an env override; the candidate list is only a
-# suggested default to pre-fill the question — the user's answer wins.
-$wdbgcsCandidates = @(
-    $env:WDBGCS_PATH,                                    # user/env override wins
-    'C:\Tools\WinDbgCs\WinDbgCsExt.dll',                  # ✅ CONFIRMED WORKING v3.2.7 (2025-06 build) — PREFERRED; best for SQL 2019 dumps + the 2023-04 prebuilt mirror pair. Register from C:\Tools\WinDbgCs\NetStandard20Refs\
-    'C:\Tools\windbgcs.3.0.8\WinDbgCsExt.dll',            # v3.0.8 — local codegen fallback
-    'C:\Tools\WinDbgCs.amd64\WinDbgCsExt.dll',            # ⛔ v4.11.0 — TOO NEW: every row = "Missing from SqlDebugTypes" on the 2023-04 prebuilt pair
-    'C:\Users\lduan\tools\DumpViewer\WinDbgCsExt.dll'     # v3.79.0 — hard-fails when prebuilt pkg missing
-)
-if ($env:NugetMachineInstallRoot) {
-    $wdbgcsCandidates += (Get-ChildItem "$env:NugetMachineInstallRoot\WinDbgCs*\WinDbgCsExt.dll" -ErrorAction SilentlyContinue | ForEach-Object FullName)
-}
-$wdbgcs = $wdbgcsCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-
-# --- DumpViewer + SqlScriptRepl (self-hosted REPL) ---
-$dvDir  = 'C:\Users\lduan\tools\DumpViewer'
-$dvExe  = Join-Path $dvDir 'DumpViewer.exe'
-$replExe = Join-Path $dvDir 'SqlScriptRepl.exe'
-$dvOk   = (Test-Path $dvExe) -and (Test-Path (Join-Path $dvDir 'dbgeng.dll')) -and (Test-Path (Join-Path $dvDir 'CsDebugScript.Engine.dll'))
-$replOk = Test-Path $replExe
-
-# --- DScript .js scripts folder (USER-PROVIDED, build-specific) ---
-# Not auto-discoverable — ASK the user for it (e.g. C:\Tools\dscript\sql2019).
-# Accept an env override, else leave null and prompt.
-$dscriptPath = $env:DSCRIPT_PATH
-$dscriptOk = $dscriptPath -and (Test-Path (Join-Path $dscriptPath 'task.js'))
-
-# --- mex.dll folder (USER-PROVIDED) ---
-# Not auto-discoverable — ASK the user for it (e.g. C:\Tools\mex).
-$mexPath = $env:MEX_PATH
-$mexOk = $mexPath -and (Test-Path (Join-Path $mexPath 'mex.dll'))
-
-"WinDbgCsExt : " + ($(if ($wdbgcs) { "INSTALLED  ($wdbgcs)" } else { 'MISSING' }))
-"DumpViewer  : " + ($(if ($dvOk)   { "INSTALLED  ($dvExe)" } else { 'MISSING' }))
-"SqlScriptRepl: " + ($(if ($replOk){ "BUILT      ($replExe)" } else { 'NOT BUILT' }))
-"DScript .js : " + ($(if ($dscriptOk){ "PROVIDED   ($dscriptPath)" } else { 'NOT PROVIDED — ASK THE USER' }))
-"mex.dll     : " + ($(if ($mexOk){ "PROVIDED   ($mexPath)" } else { 'NOT PROVIDED — ASK THE USER' }))
-```
-
-### Decision & install prompts
-
-- **WinDbgCsExt MISSING** → tell the user:
-  > `WinDbgCsExt.dll` not found. Install the **`WinDbgCs.amd64`** NuGet package (internal
-  > feed) and extract to `C:\Tools\WinDbgCs.amd64\`, or pull it from the CoreXT cache
-  > (`%NugetMachineInstallRoot%\WinDbgCs*\`) / a built DsMainDev enlistment. v3.0.8+
-  > (`C:\Tools\windbgcs.3.0.8\`) is preferred (local on-the-fly codegen fallback).
-
-  Without it, the cdb `!execute`/`!evaluate` mirrors path (Path A / Part 1) cannot run.
-  You can still do Part 2 native dump-walking with cdb + symbols only.
-
-- **DumpViewer MISSING** → tell the user:
-  > DumpViewer not found at `C:\Users\lduan\tools\DumpViewer\`. Install/copy the
-  > **DumpViewer** package (built from `SqlTelemetry/Src/Tools/DumpViewer`) as a
-  > **complete self-contained folder** — it must include `DumpViewer.exe`, `dbgeng.dll`,
-  > `dbghelp.dll`, all `CsDebugScript.*.dll`, `ReportTemplate\`, and `DumpViewerConfig.xml`.
-
-  This is the reliable path for arbitrary `Class.Method` mirror scripts (the cdb batch
-  path fails on CodeGen `dynamic` dispatch — see repo memory `sql_script_repl.md`).
-
-- **DumpViewer INSTALLED but SqlScriptRepl NOT BUILT** → build it (do NOT block on this
-  unless the user wants the interactive REPL):
-  ```powershell
-  powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-analysis\scripts\build_sqlscriptrepl.ps1
-  ```
-  (Self-locating: compiles the sibling `scripts\SqlScriptRepl.cs`; outputs
-  `SqlScriptRepl.exe` INTO the DumpViewer folder. See repo memory `sql_script_repl.md`.)
-
-- **DScript `.js` scripts NOT PROVIDED** → **ASK the user** for the folder:
-  > Which folder holds the DScript `.js` scripts (`task.js`, `tsqlstack.js`,
-  > `callstack.js`, `all_ios.js`)? e.g. `C:\Tools\dscript\sql2019`. It is
-  > **build-specific** — pick the sub-folder matching the dump's SQL major version
-  > (`...\sql2019\`, `...\SQL2016\`, …). This becomes `{dscript_path}` in all
-  > `!dscript.run` commands. Do NOT hardcode a path — 分析第二步 (task.js sweep) needs it.
-
-- **mex.dll NOT PROVIDED** → **ASK the user** for the folder:
-  > Which folder holds `mex.dll`? e.g. `C:\Tools\mex`. This becomes `{mex_path}` in the
-  > `.load {mex_path}\mex.dll` command. Do NOT hardcode a path — 分析第一步 (`!mex.us`
-  > thread inventory) needs it.
-
-> If **both** surfaces are missing, do not proceed with mirror analysis — surface the
-> install prompts and wait. Native Part 2 (cdb + symbols) is the only fallback and
-> should be offered explicitly.
-
----
-
-## Step 1: Session Setup
-
-### Path A — cdb.exe CLI Automated
-
-#### 1.1 Verify cdb.exe availability
-
-**ALWAYS check the WinDbg Store (Appx/MSIX) package too** — on machines with the modern WinDbg
-(`Microsoft.WinDbg.Slow`/`Microsoft.WinDbg`) installed from the Store, `cdb.exe` lives under
-`C:\Program Files\WindowsApps\Microsoft.WinDbg*\amd64\cdb.exe`, NOT in `Windows Kits\...\Debuggers`.
-If you only check Kits paths you will wrongly conclude "cdb not found" and fall back to Path B — do NOT
-do that. Enumerate the Appx location as well and run cdb.exe yourself.
-
-```powershell
-$cdbCandidates = @(
-    (Get-Command cdb.exe -ErrorAction SilentlyContinue).Source,
-    "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe",
-    "${env:ProgramFiles}\Windows Kits\10\Debuggers\x64\cdb.exe"
-)
-# WinDbg Store/MSIX package (most common on dev boxes) — dynamic version, so resolve at runtime
-$wdbg = (Get-AppxPackage *WinDbg* | Select-Object -First 1).InstallLocation
-if ($wdbg) { $cdbCandidates += (Join-Path $wdbg 'amd64\cdb.exe') }
-
-$cdbPaths = $cdbCandidates | Where-Object { $_ -and (Test-Path $_) }
-if ($cdbPaths) { $cdb = $cdbPaths[0]; "Found: $cdb" }
-else { "cdb.exe not found — fall back to Path B (WinDbg GUI)" }
-```
-
-**DScript COM registration (do this before `!dscript.run`)**: the Store WinDbg package version changes
-on every auto-update. Run the HKCU registration script (dynamically resolves the current
-`Microsoft.WinDbg*\amd64\pri\DScript.dll` via `Get-AppxPackage`) so the 4 DScript CLSIDs point at the
-installed package — otherwise `!dscript.run` fails with `not registered as a COM server`. NEVER hardcode
-the package version. NEVER `.load WinDbgCsExt.dll` / `!dcs_initsymsvr` in the SAME session you run
-`!dscript.run` — it poisons DScript (see repo memory `dscript-dump-analysis.md`).
-
-#### 1.2 Generate .cdb script file
-
-Create a temp script file with all commands. cdb.exe reads one command per line.
-Lines starting with `*` are comments.
-
-```powershell
-$scriptPath = "reports/{case_id}_dump_commands.cdb"
-```
-
-Script file content — **HEADLESS-SAFE ONLY**. Put NO mirror `!execute`/`!evaluate`
-(or `!dcs_initsymsvr`) here — they stall/error under `cdb -cf` batch. Emit those as the
-Path B manual WinDbg block instead. This batch carries native + `mex` + DScript only:
-
-```text
-* ========================================
-* SQL-CSI Dump Analysis — Case: {case_id}  (headless-safe cdb -cf batch)
-* Mirror !execute/!evaluate are NOT here — see Path B (manual WinDbg) / Step 2.2.
-* ========================================
-.sympath srv*C:\Symbols*https://symweb.azurefd.net
-.reload /f
-* --- dump metadata (native) ---
-vertarget
-lmvm sqlservr
-* --- thread inventory (分析第一步) via mex → log ---
-.load {mex_path}\mex.dll
-.logopen reports/{case_id}_us.txt
-!mex.us
-.logclose
-* --- (optional) DScript .js sweep (Part 3); {dscript_path} is user-provided ---
-* ~<TID> s ; !dscript.run {dscript_path}\task.js ; .echo ===TASK_<TID>_DONE===
-q
-```
-
-> The final `q` exits cdb.exe after all commands finish.
->
-> **Mirror commands** (dump-time, exception ring, sessions, memory clerks, schedulers,
-> wait stats, trace flags, `{subsystem_commands}`) are delivered as the **Path B manual
-> WinDbg block** (paste into the WinDbg GUI) or run via `SqlScriptRepl.exe` — NOT in this
-> cdb `-cf` batch. The mirror-DLL **acquisition** (`!dcs_initsymsvr` / build-share copy)
-> stays automated — see "Step 1 (fallback)".
-
-#### 1.3 Run cdb.exe and capture output
-
-```powershell
-$dumpPath  = "{dump_path}"
-$scriptFile = "reports/{case_id}_dump_commands.cdb"
-$outputFile = "reports/{case_id}_dump_output.txt"
-
-# -z   open dump file
-# -cf  run commands from script file
-# -logo  log all output to file (overwrite)
-# -G   ignore final breakpoint on process exit
-# -lines  load line number info
-& $cdb -z $dumpPath -cf $scriptFile -logo $outputFile -G -lines
-```
-
-> **Timeout**: Allow up to 5 minutes for large dumps.
-
-#### 1.4 Read and parse output
-
-After cdb.exe completes, read the output file and proceed to **分析第一步** (thread
-inventory) — or, if the user pasted pre-captured output, jump to **分析第四步 (Parse &
-Compile Findings)**.
-
-```powershell
-$output = Get-Content $outputFile -Raw
-```
-
-### Path B — WinDbg GUI (Manual)
-
-Generate a copy-pasteable command block for the user:
-
-```windbg
-* ========================================
-* SQL-CSI Dump Analysis Script
-* Case: {case_id}
-* Generated: {timestamp}
-* ========================================
-
-* Open dump: windbgx -z {dump_path}
-
-.sympath srv*C:\Symbols*https://symweb.azurefd.net
-.reload /f
-!dcs_initsymsvr sqlservr
-!dcs_initsymsvr sqldk
-!execute
-```
-
----
-
-## Step 1 (fallback): When `!dcs_initsymsvr` fails (404) — load Mirrors manually from the build share
-
-> **This is a Step 1 setup addendum, not an analysis step.** Only run it if
-> `!dcs_initsymsvr` 404s. It does not reorder ahead of 分析第一步 — once mirrors load
-> (or you fall back to Part 2 native walking), resume at 分析第一步.
-
-> **Split of responsibilities (important):** the **acquisition** of the mirror DLLs is
-> **AUTOMATED — the agent does it** (either `!dcs_initsymsvr` auto-download, or the
-> auto-copy-from-build-share script below). Only the mirror **`!execute`/`!evaluate`**
-> commands are run **manually in the WinDbg GUI** (or via `SqlScriptRepl.exe`). Do NOT
-> ask the user to copy DLLs by hand — resolve the build and copy them programmatically.
-
-`!dcs_initsymsvr sqlservr` pulls the managed **mirror** assemblies for the dump's
-exact build via a symbol-server **SymSvrManifest** (produced at build time by
-`SqlCsScripts.SymSvrManifest.proj` + `SymSvrManifestConfig.xml`, keyed on the
-`sqlservr.exe` build signature). If that manifest was **never published for the build**
-(e.g. SQL 2019 CU20), the fetch returns **404** and the Mirrors path looks dead. A newer
-`WinDbgCsExt.dll` does **not** fix this — the manifest is missing **server-side**.
-
-**Workaround (per SOP `SQLMirrors0003`): bypass symweb and load the mirror DLLs
-directly from the released-build file share.** Version must match the dump **exactly**.
-
-1. Get the dump's exact build: `lmDvm sqlservr` (e.g. `15.0.4312.2`) — **do NOT guess
-   from CU number**; the file/product version is authoritative.
-2. **AUTO-COPY the mirror pair into a per-build sub-folder** under `{wdbgcs}\NetStandard20Refs\build_<version>\`
-   (side-by-side with the default pair — do **NOT overwrite** the default `NetStandard20Refs\`
-   pair, which may be pinned to a different build for other dumps). Two paths on the share
-   are equivalent — either works:
-   - `\\sqlbuilds\Released\SQLServer<year>\RTM\Hotfixes\<build>\bin\retail\x64\` (retail)
-   - `\\sqlbuilds\Released\SQLServer<year>\RTM\Hotfixes\<build>\debug\amd64\`  (debug — verified 2026-07)
-
-   The agent runs this automatically (do NOT hand it to the user as manual `copy` commands):
-   ```powershell
-   # --- AUTO: resolve build + copy mirror DLLs from the build share into a per-build sub-folder ---
-   $wdbgcsDir  = 'C:\Tools\WinDbgCs'    # user-provided WinDbgCs folder
-   $build      = '15.0.4312.2'          # from `lmDvm sqlservr` — RESOLVE, don't guess
-   $dst        = Join-Path $wdbgcsDir "NetStandard20Refs\build_$build"
-   New-Item -ItemType Directory -Force -Path $dst | Out-Null
-   # Branch varies by product/release: SQLServer2019\RTM\Hotfixes, SQLServer2022\..., etc.
-   $share      = "\\sqlbuilds\Released\SQLServer2019\RTM\Hotfixes\$build\debug\amd64"
-   foreach ($f in 'SqlDebugTypes.dll','SqlCsScripts.dll','SqlDebugTypesPartial.cs') {
-     $src = Join-Path $share $f
-     if (Test-Path $src) { Copy-Item $src $dst -Force; "copied $f -> $dst" }
-     else { Write-Warning "missing on share: $src (verify build/branch)" }
-   }
-   ```
-   Available SQL2019 hotfix builds in the share (verified 2026-07): `4312.2, 4316.3,
-   4318.3, 4322.2, 4326.1, 4335.1, 4338.1, 4345.5, 4355.3, 4365.2, 4375.4, 4384.2,
-   4385.2, 4392.2, 4405.4, 4415.2, 4420.2, 4430.1`.
-3. In a **dedicated** cdb/WinDbg session (do NOT mix with DScript — see Part 3), load
-   the extension, then **explicitly register the script assembly with `!execute <full
-   path>\SqlCsScripts.dll` BEFORE any `Tasks.Enumerate` expression**. This registration is
-   **session-scoped and is lost on every WinDbg restart** — skipping it gives `No results
-   to process` (the SCRIPTS menu with nothing bound) or `Could not load SqlDebugTypes`.
-   `WinDbgCsExt` resolves the pair's dependency (`SqlDebugTypes.dll`) from a
-   `NetStandard20Refs\` sub-folder **next to `WinDbgCsExt.dll`**, so on a 404/offline build
-   copy the mirror pair into that sub-folder FIRST (one-time on disk; persists), then
-   `.load`, then `!execute <SqlCsScripts.dll>`, then the expression. **These `!execute`
-   / `!evaluate` commands DO batch cleanly in headless `cdb -cf <batch>`** (verified
-   2026-07 on SQL 2019 15.0.4312.2): put the sequence into a `.cdb` file, one command
-   per line, terminate with `q`, and pass with `-cf`. The `TaskOutput:` sentinel only
-   appears if `!dcs_initsymsvr` succeeds; for direct `!execute <path>\SqlCsScripts.dll`
-   loads use per-query `.echo == MARKER ==` fences instead to segment the log.
-
-   > **AUTOMATED DIRECT-LOAD (preferred once mirror pair is seeded):** use
-   > `.github/skills/dump-overall/scripts/run_windbgcs_direct.ps1`. It writes the batch,
-   > runs cdb, and pass/fail-reports each expression by marker fence. Example:
-   > ```powershell
-   > pwsh -NoProfile -Command "& '.\.github\skills\dump-overall\scripts\run_windbgcs_direct.ps1' `
-   >   -Dump    'C:\Temp\<case>\SQLDump0001.mdmp' `
-   >   -OutDir  'C:\Users\lduan\sqlcsi-archive\reports\<case>_dump_code_analysis' `
-   >   -CaseId  '<case>' `
-   >   -Scripts 'C:\Tools\WinDbgCs\NetStandard20Refs\build_<version>\SqlCsScripts.dll' `
-   >   -Expr @('Tasks.Enumerate',
-   >           'SOSRingBuffers.EnumerateExceptionRingRecords',
-   >           'SOSRingBuffers.EnumerateSchedulerMonitorRecords',
-   >           'SOSRingBuffers.EnumerateMemoryBrokerRingRecords')"
-   > ```
-   > **Verified working `!execute` methods (SQL 2019 15.0.4312.2, 2026-07):**
-   > `Tasks.Enumerate`, `SOSRingBuffers.EnumerateExceptionRingRecords`,
-   > `SOSRingBuffers.EnumerateSchedulerMonitorRecords`,
-   > `SOSRingBuffers.EnumerateMemoryBrokerRingRecords`,
-   > `SOSRingBuffers.EnumerateResourceMonitorRecords`.
-   > **Confirmed WRONG class names** (do NOT try — return `No results to process`):
-   > `Times.DumpTime`, `Times.SqlUptime`, `ProcessSummary.Enumerate`. When in doubt,
-   > run bare `!execute` (no arg) once to dump the A-Z catalog for the current build.
-   >
-   > Both scripts (`run_windbgcs_tasks.ps1` and `run_windbgcs_direct.ps1`) auto-resolve
-   > cdb.exe via `Get-Command` → Windows Kits → `Get-AppxPackage *WinDbg*` →
-   > `${env:ProgramFiles}\WindowsApps\Microsoft.WinDbg*_x64_*\amd64\cdb.exe` glob (matches
-   > `.Slow` / `.Fast` / `.Preview` variants). If none work, pass `-Cdb` explicitly.
-   > **Requires `pwsh` (PowerShell 7)**, not Windows PowerShell 5.1.
-
-   Interactive WinDbg GUI is only required for **exploratory** LINQ:
-   ```powershell
-   # AUTO: seed the mirror pair next to WinDbgCsExt.dll (one-time)
-   Copy-Item $dumpFolder\SqlCsScripts.dll,$dumpFolder\SqlDebugTypes.dll `
-     (Join-Path (Split-Path -Parent $wdbgcs) 'NetStandard20Refs') -Force
-   ```
-   ```text
-   .load <path>\WinDbgCsExt.dll                                              * full path required
-   !execute <path>\NetStandard20Refs\build_<version>\SqlCsScripts.dll        * REGISTER build-matched script assembly (session-scoped; lost on restart)
-   !execute                                                                  * (NO ARG) prints full A-Z script menu — authoritative catalog for this build
-   !execute Tasks.Enumerate                                                  * now the method resolves
-   ```
-
-   > **Enumerate all available scripts:** after registering the assembly, run `!execute`
-   > with **no argument** to get the full A-Z catalog. This is the definitive way to see
-   > what canned expressions are valid for the current build — much broader than
-   > `SqlScriptRepl.exe`'s ~11-item auto-discovery filter (the headless REPL uses a
-   > stricter `ScriptDiscovery.DiscoverRunnableScripts` gate; many `[Script]`-attributed
-   > classes like `Sessions/Schedulers/Databases/MemoryClerks/Locks/Connections/
-   > SOSActiveTasks/HadronManager/SOSNodes/SOSTicks/ExecRequests` return `not found`
-   > under SqlScriptRepl but resolve fine under WinDbg GUI `!execute`).
-
-**Gotchas:**
-- `The type initializer for 'SqlDebugTypes.NodeManager' threw an exception` = the
-  DLLs are from a **different build** than the dump. Re-verify with `lmDvm sqlservr`
-  and re-copy the matching version.
-- **EVERY row = `Missing from SqlDebugTypes`** (in `!execute enumerateall`), or a wall of
-  `InvalidMemoryAddressException ... SqlDebugTypes.SOS_Task.get_...` for **ALL** tasks =
-  the loaded **WinDbgCsExt is too new for the prebuilt mirror pair**. On this box the
-  2023-04 `SqlCsScripts.dll`/`SqlDebugTypes.dll` pair works with
-  `C:\Tools\WinDbgCs\WinDbgCsExt.dll` (**v3.2.7**, 2025-06 build) but NOT with
-  `C:\Tools\WinDbgCs.amd64\WinDbgCsExt.dll` (**v4.11.0** — all types Missing). Fix: `.load`
-  the older compatible WinDbgCsExt, then `!execute <NetStandard20Refs>\SqlCsScripts.dll`,
-  then the expression. **For SQL 2019 dumps, prefer WinDbgCsExt v3.2.7.** **Distinguish:**
-  *ALL* rows Missing = version mismatch (fix the
-  ext version); a *few* `InvalidMemoryAddressException` rows on a **minidump** =
-  uncaptured pages = **benign** (the main table is still complete).
-- `Debug types dll out of date` → CodeGen kicks in: on WinDbgCs **< 3.1.2** rename
-  `SqlDebugTypesPartial.cs` → `SqlCsScripts.SqlDebugTypesPartial.cs`; on **≥ 3.1.2**
-  no rename needed.
-- `WinDbgCsExt.dll` comes from NuGet (`WinDbgCs.amd64`), CoreXT cache
-  (`%NugetMachineInstallRoot%\WinDbgCs*\`), or a built DsMainDev enlistment.
-- **This only fixes the 404 (can't-load-scripts) problem — it does NOT recover pages
-  missing from a minidump.** If the data you want lives in an uncaptured page, manual
-  mirrors read the same fault as DScript (see Part 3, minidump note).
+> **All setup — Step 0 Pre-Check (tool inventory + install prompts), Step 1 Session
+> Setup (cdb resolution + DScript COM registration + Path A/B), and the Step 1 fallback
+> (mirror-404 build-share load) — lives in [`../dump-overall/reference/setup.md`](../dump-overall/reference/setup.md).**
+> Run it FIRST, then continue with 深挖第一步 / 深挖第二步 below. (This skill uses the
+> cdb/mirrors + DScript + `mex.dll` subset; DumpViewer-first is the `dump-overall` skill.)
 
 ---
 
@@ -545,16 +129,47 @@ directly from the released-build file share.** Version must match the dump **exa
 > **先运行 `dump-overall`** 得到:①SQLOS worker 状态分布 + 任务级权威状态
 > (`Tasks.Enumerate`) + 按调度器分布 + 关键观察/下一步(第一步);②`task.js` 扫描 +
 > `tsqlstack.js` + 运行时状态(阻塞链)表(第二步)。拿到「下一步」指向的子系统后,
-> **再回到本 skill** 继续 **分析第三步(子系统聚焦)** 与 **分析第四步(根因)**。
+> **再回到本 skill** 继续 **深挖第一步(子系统聚焦)** 与 **深挖第二步(根因)**。
 >
 > 本 skill 保留 Step 0/Step 1(工具与会话设置)、Part 2(native dump-walking)、
-> Part 3(DScript)、cdb/LINQ 命令参考,供第三步/第四步深挖复用。
+> Part 3(DScript)、cdb/LINQ 命令参考,供深挖第一步/深挖第二步复用。
+
+### Dump-overall handoff contract（固化入口）
+
+Do not start subsystem deep-dive until `dump-overall` has passed its completion verifier:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\verify_case_deliverables.ps1 `
+  -CaseId '{case_id}' `
+  -OutDir 'C:\Users\lduan\sqlcsi-archive\reports\<case>_<brief_words>\<case>_dump_overall' `
+  -Ledger 'C:\Users\lduan\sqlcsi-archive\reports\<case>_<brief_words>\<case>_dump_overall\workflow_ledger.json' `
+  -Stage Completion
+```
+
+The deep-dive consumes, rather than regenerates, these overall artifacts:
+
+| Artifact | Use in dump-analysis |
+|----------|----------------------|
+| `task_fields.json` | main/child task state, wait type, scheduler, blocker SPID/thread; primary source for blocking-chain analysis |
+| `{case}_sql_exec_thread.html` / `{case}_sql_exec_manifest.json` | decoded main statements, partial `tsqlstack.js` evidence, child stack details |
+| `{case}_tasks.html` / `{case}_tasks_stats.json` | authoritative `Tasks.Enumerate` state distribution and per-scheduler distribution |
+| `{case}_sys.schedulers.txt` or `{case}_Schedulers.Enumerate.txt` | scheduler runnable/work queue, active worker, yield counters |
+| `txt_detail\{case}_SOSRingBuffers.EnumerateSchedulerMonitorRecords.txt` | SchedulerMonitor history (`STUCK_DISPATCHER`, `NONYIELD`, etc.) when available |
+| `{case}_thread_categories.html` / `thread_categories.json` | functional thread buckets and stable `cat-<key>` anchors, including empty buckets |
+| raw failure logs (`*_direct*.txt`, `*_dscript*.txt`, `workflow_ledger.json`) | minidump / mirror / DScript limitations; preserve as evidence, do not hide |
+
+For Scheduler / Stalled Dispatcher cases, the verified pattern is: start from `task_fields.json`
+to find many runnable/suspended tasks sharing one blocker reason such as `SEARCH_OR scheduler
+yield`; correlate the blocker thread/SPID/scheduler with `sys.schedulers.js` or
+`Schedulers.Enumerate`; then corroborate with SchedulerMonitor ring records if present. If mirror
+scheduler expressions return `No results`, record that raw result and use the DScript scheduler
+inventory instead.
 
 <!-- The 线程清单与状态统计 (第一步) & 执行语句线程统计 (第二步) content moved to .github/skills/dump-overall/SKILL.md -->
 
 ---
 
-## 分析第三步（报告「第三步」）：子系统聚焦 · Determine Analysis Focus
+## 深挖第一步（报告「深挖第一步」）：子系统聚焦 · Determine Analysis Focus
 
 ### 2.1 Subsystem-to-Script Mapping
 
@@ -603,7 +218,7 @@ These commands provide essential context regardless of subsystem:
 
 ---
 
-## 分析第三步（续）：生成错误专属命令 & 深挖 · Error-Specific Commands & Deep Dives
+## 深挖第一步（续）：生成错误专属命令 & 深挖 · Error-Specific Commands & Deep Dives
 
 For each error number, generate targeted queries:
 
@@ -714,7 +329,7 @@ When a specific task address is known (from previous query results):
 
 ---
 
-## 分析第四步：解析结果 & 汇总发现 · Parse & Compile Findings (Manual Handoff)
+## 深挖第二步：解析结果 & 汇总发现 · Parse & Compile Findings (Manual Handoff)
 
 When the user pastes WinDbg output back, extract:
 
@@ -934,8 +549,8 @@ Keep the same section order and headings as the report we align to:
 1. **第一步：线程清单与状态统计** — `!mex.us` thread inventory + worker-state stats +
    authoritative `Tasks.Enumerate` TaskState + 按调度器分布 + 关键观察/下一步.
 2. **第二步：执行语句线程统计** — task.js sweep + tsqlstack + 运行时状态表 (blocking chain).
-3. **第三步：子系统聚焦** — subsystem-specific mirror queries (HADR/Memory/Scheduler/…).
-4. **第四步：解析结果 & 汇总发现** — findings, call-stack functions, server state, root cause.
+3. **深挖第一步：子系统聚焦** — subsystem-specific mirror queries (HADR/Memory/Scheduler/…).
+4. **深挖第二步：解析结果 & 汇总发现** — findings, call-stack functions, server state, root cause.
 
 > Ask the user for **language** (English / 中文) and **format** (HTML / Markdown) before
 > generating — but the **section layout stays as the current report**. HTML uses the
@@ -1213,49 +828,23 @@ giving SOS-style, source-grounded per-thread / task / IO analysis even where Mir
 don't load. Very effective as an **independent cross-check** of native walking
 (Part 2) — e.g. confirming a latch owner's Worker state and blocker chain.
 
-## Prepare (one-time per-user registration — no admin, no UAC, persists)
+## Prepare + run → single-sourced in `../dump-overall/SKILL.md` §DScript operational rules
 
-DScript hosts **4 COM objects**; cdb refuses `!dscript.run` until their CLSIDs are
-registered, else: `*** ERROR: The DSCRIPT extension is not registered as a COM server
-... dscript!DebugExtensionInitialize failed with 0x80070005`.
-
-**Register them per-user (HKCU) — no elevation needed. COM resolves HKCU before HKLM.**
-
-```powershell
-pwsh -NoProfile -File .github\skills\dump-analysis\scripts\register_dscript.ps1
-```
-
-The script auto-detects the newest `DScript.dll` (running debugger proc → WindowsApps
-`Microsoft.WinDbg*` package → Windows Kits), re-extracts the 4 CLSIDs from the dll's
-own Unicode strings, and writes `HKCU\Software\Classes\CLSID\{guid}\InprocServer32`.
-The keys **persist across reboots** and take effect in an **already-running cdb** (COM
-activates lazily). The 4 CLSIDs are: `7cadfd15-…-981951734836`, `931a9cec-…-eb9a785aee3d`,
-`987f2c24-…-1b4a6688169f`, `ff9f7123-…-21df9dc1dedc`.
-
-> **WinDbg auto-updates break it** — the package version in the path changes, so the
-> HKCU value points to the old (gone) dll → `not registered as a COM server` returns.
-> **Fix: just re-run `register_dscript.ps1`** (it re-detects the new path). The skill
-> relies on dscript long-term, so re-run this whenever dscript starts failing.
+> **DScript COM registration (HKCU `register_dscript.ps1`, no admin) and the clean-run
+> procedure are single-sourced in the `dump-overall` skill** — see its
+> **`## DScript operational rules`** section (and
+> [`reference/setup.md`](../dump-overall/reference/setup.md)). Because `dump-overall`
+> always runs **before** this skill in the same cdb session, DScript is already registered
+> and those rules already apply by the time you reach Part 3 — do NOT re-register.
 >
-> The legacy elevated-HKLM self-registration also works but needs a UAC click and
-> hard-codes one version path — prefer the HKCU script above.
-
-## Running a script
-
-```text
-.sympath srv*C:\Symbols*https://symweb.azurefd.net
-.reload /f
-~<TID> s                                  * task.js targets the CURRENT thread — switch first
-!dscript.run {dscript_path}\task.js ; .echo ===DONE===   * {dscript_path} = user-provided scripts folder; wait for the marker — see "⛔ CRITICAL" below
-```
-> `!dscript.run` **auto-loads DScript** (prints `--- Loading DScript`). An explicit
-> `.load "<path with spaces>"` line may fail (cdb mangles quoted spaces) — harmless,
-> auto-load covers it.
->
-> **Do NOT `.load WinDbgCsExt` or run `!dcs_initsymsvr` / `!dcs_initlocal` before ANY
-> `!dscript.run`** — WinDbgCsExt is a separate C#/CsDebugScript extension that poisons
-> the DScript COM session (`0x800A0030 [Error in loading DLL]`). See the **⛔ CRITICAL**
-> subsection at the end of Part 3 for why.
+> Quick recall (authoritative text lives in `dump-overall`):
+> ```text
+> ~<TID> s                                 * dscript targets the CURRENT thread — switch first
+> !dscript.run {dscript_path}\task.js ; .echo ===DONE===
+> ```
+> `{dscript_path}` is user-provided/build-specific — **ASK the user**; do NOT hardcode.
+> **Never** `.load WinDbgCsExt` / `!dcs_init*` in a `!dscript.run` session (COM/DIA
+> poisoning → `0x800A0030`); always wait for the `===DONE===` marker before reading results.
 
 ## Key scripts
 
@@ -1287,89 +876,29 @@ memory are available"*). To enumerate pending IOs / per-IO latency you need a
 one-slow-IO-vs-many-IO question: read the owner worker's IO counters
 (`m_NumberOfIOs` vs `m_NumberOfContextSwitches`) — see latch_timeout reference Step 5.
 
-## ⛔ CRITICAL — how to run `.js` scripts WITHOUT breaking the session
+## ⛔ Running `.js` without breaking the session → single-sourced in `../dump-overall/SKILL.md`
 
-Every DScript `.js` (`task.js`, `tsqlstack.js`, `callstack.js`, `all_ios.js`, and any
-future script) runs **purely through the DScript extension against private symbols**.
-It does **NOT** use the WinDbgCs / SqlCsScripts / Mirrors mechanism at all. Hard-won
-lessons — follow exactly:
+> The full hard-won operational rules — **never mix `.load WinDbgCsExt` / `!dcs_init*` with
+> `!dscript.run`** in the same session (separate surfaces; COM/DIA poisoning →
+> `0x800A0030 [Error in loading DLL]` — quit and start a fresh cdb if you did), and
+> **always append `.echo ===..._DONE===` and WAIT** (`task.js` ~1–2 s/thread; `tsqlstack.js`
+> ≥ 5 min — the line `Input string:(` is in-progress, NOT a hang; idle-detection returning
+> in ~1 min is not completion) — are single-sourced in `dump-overall`'s
+> **`## DScript operational rules`**. They apply verbatim here.
 
-1. **NEVER `.load WinDbgCsExt.dll` and NEVER run `!dcs_initsymsvr` / `!dcs_initlocal`
-   before ANY `!dscript.run` (task.js, tsqlstack.js, callstack.js, all_ios.js, …).**
-   The Mirrors init (Part 1) and DScript (Part 3) are **two completely separate
-   surfaces — do not mix them in the same session.** If you already ran `.load
-   WinDbgCsExt` / `!dcs_init*` and dscript now errors, **quit and start a fresh cdb.**
+**Deep-dive–specific notes (not part of the shared rules):**
 
-   **Why loading WinDbgCsExt breaks `!dscript.run`:** `WinDbgCsExt.dll` (newest at
-   `C:\Tools\WinDbgCs\WinDbgCsExt.dll`; older `C:\Tools\windbgcs.3.0.8\`) is a
-   *different* extension — the **CsDebugScript** engine: managed **C# / Roslyn**
-   (`Microsoft.CodeAnalysis*.dll`) + `CsDebugScript.Engine` + its own `msdia140.dll`.
-   It is unrelated to DScript, and **a newer build does NOT change this** — same
-   mechanism, same poisoning. Two failure modes result:
-   - `!dcs_initsymsvr` pulls **managed "mirror" assemblies** for the target build via a
-     symbol-server manifest (`CsDebugScript.SymSrvManifestGen`). On a build with **no
-     published SqlCsScripts manifest → 404**; on a **minidump** the mirrors can't bind
-     to process memory anyway.
-   - Loading WinDbgCsExt into the same process pulls in its own managed engine +
-     `msdia140.dll`, which **disturbs DScript's COM object-model / DIA activation**, so
-     the *next* `!dscript.run` fails with `0x800A0030 [Error in loading DLL]`. This is
-     the poisoned-session symptom — the DLL loaded fine, but it broke DScript.
-   - (Even a bare `.load WinDbgCsExt.dll` fails unless you give the full
-     `C:\Tools\WinDbgCs\WinDbgCsExt.dll` path or set `.extpath`.)
-
-
-2. **Clean run procedure (the only thing you need):**
-   ```text
-   cdb -z <dump>.mdmp -lines            * fresh session, symbols srv*C:\Symbols*https://symweb.azurefd.net
-   ~<TID> s                             * dscript targets the CURRENT thread — switch first
-   !dscript.run {dscript_path}\task.js ; .echo ===TASK_<TID>_DONE===
-   ```
-   `!dscript.run` auto-loads DScript (`--- Loading DScript`). No other setup is needed
-   beyond the one-time `register_dscript.ps1` (HKCU COM registration).
-   > `{dscript_path}` is **user-provided and build-specific** — **ASK the user** for the
-   > scripts folder (e.g. `C:\Tools\dscript\sql2019\`, or `...\SQL2016\`); do NOT
-   > hardcode it. Pick the folder matching the dump's product major version.
-
-3. **Always append an explicit `.echo ===..._DONE===` marker and WAIT for it. Do NOT
-   kill the session early.** Headless cdb is **not** inherently slow — with **warm
-   symbols** (`C:\Symbols` already populated) and the correct invocation (1.7.2 (B):
-   `-y` for symbols, `$$><`/`-cf` for the command file, `q` inside the file) `task.js`
-   runs in **~1–2 s/thread**. Prior "hangs" were the cdb `-c` parsing traps (1.7.2 (B))
-   and cold symbol downloads — **not** the script:
-   | Script | WinDbg GUI (S_OK) | Headless cdb (warm sym) | Notes |
-   |--------|-------------------|--------------|-------|
-   | `task.js` | ~12–13 s | ~1–2 s/thread | fast; safe to `waitForOutput` |
-   | `tsqlstack.js` | ~290 s (~5 min) | **≥ 5 min** | the line `Input string:(` is **in-progress**, NOT a hang |
-
-   Idle-detection can return in ~1 min while the script is still running — that is
-   **not** completion. Poll for the `===..._DONE===` marker (or `----- Script Complete
-   -----`) before reading results. Killing at the first idle signal was the #1
-   self-inflicted "hang". `tsqlstack.js` does **not** hang; it is just slow.
-
-4. **Minidump read faults are a dump limitation, not a script/procedure error.** On a
-   minidump, `tsqlstack.js` reads whatever pages were captured, then may end with
-   `0x80020101` / `0x8007001E (ERROR_READ_FAULT)` / `0x800A0030`, often with
-   `Cannot read from virtual address 0x...`, `<CORRUPTED>`, or `Null MXC`. Two cases:
-   - **Tail-only fault (common):** the `Input string:` statement text is **fully
-     captured**; only trailing **parameter values** aren't. Use the statement text;
-     ignore the tail error.
-   - **Truncated statement (e.g. thread 370):** the fault hits **mid-string** —
-     `(@P0 int,...,@P20 nvarchar(40)<CORRUPTED>` then `Cannot read virtual address`.
-     The page holding the rest of the batch body + parameter values simply **isn't in
-     the minidump**, so the full T-SQL is **unrecoverable from this dump**. Record what
-     you got as `[PARTIAL]` (e.g. "large parameterized RPC, ~21 params") and move on;
-     a `.dump /ma` full/filter dump is the only way to get the rest. Manual Mirrors
-     (Step 1 fallback) would hit the **same** fault — it's a missing page, not a bind issue.
-
-5. **If headless cdb is impractical or fails, hand the user a paste-ready MANUAL WinDbg
-   block** (see 1.7.2 (C) for the sweep template) — same `!dscript.run` command, same
-   symbols; the GUI completes `tsqlstack.js` in ~5 min and `task.js` in ~13 s with
-   `returned S_OK`. **This is a deliverable you print into the reply** (placeholders
-   resolved: real `{dump_path}`, `{dscript_path}`, TIDs) — not just a suggestion to
-   "open WinDbg". In the GUI omit the trailing `q` and never `.load WinDbgCsExt`.
-
-6. **`task.js` is the fast, high-value first choice** — gives SPID, scheduler, Worker
-   state, wait type, and the **BLOCKERS chain** in seconds (e.g. it surfaced a
-   `PWAIT_HADR_CLUSAPI_CALL` blocker monopolizing a scheduler). Run `tsqlstack.js`
-   (slow) only when you need the actual T-SQL statement text + parameters.
+- **Minidump partial T-SQL.** `tsqlstack.js` may end with `0x8007001E (ERROR_READ_FAULT)` /
+  `<CORRUPTED>` / `Cannot read from virtual address`. **Tail-only fault (common):** the
+  `Input string:` statement text is fully captured — use it, ignore the trailing param
+  error. **Mid-string fault** (page not in the minidump): the full T-SQL is unrecoverable
+  from this dump — record `[PARTIAL]` (e.g. "large parameterized RPC, ~21 params"); only a
+  `.dump /ma` full/filter dump recovers the rest (manual Mirrors would hit the same missing
+  page).
+- **GUI fallback is a deliverable.** If headless cdb is impractical or fails, print a
+  paste-ready **manual WinDbg block** into the reply (placeholders resolved: real
+  `{dump_path}`, `{dscript_path}`, TIDs; omit the trailing `q`; never `.load WinDbgCsExt`) —
+  the GUI finishes `tsqlstack.js` in ~5 min and `task.js` in ~13 s (`returned S_OK`).
+- **`task.js` first.** SPID, scheduler, Worker state, wait type, and the **BLOCKERS chain**
+  in seconds; run the slow `tsqlstack.js` only when you need the actual T-SQL text + params.
 

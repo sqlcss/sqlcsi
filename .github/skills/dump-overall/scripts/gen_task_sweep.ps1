@@ -35,6 +35,10 @@ param(
     [Parameter(Mandatory=$true)][string]   $OutWds,        # path to write the generated .wds
     [string] $Script  = 'task.js',
     [switch] $Run,                                          # also run it headless in cdb
+    [switch] $RunPerThread,                                 # run each thread in its own bounded cdb process
+    [int] $PerThreadTimeoutSec = 60,                         # used with -RunPerThread
+    [int] $ShardSize = 0,                                    # with -Run, run bounded shards of this size
+    [int] $ShardTimeoutSec = 300,                             # used with -ShardSize
     [string] $Dump,                                         # required with -Run
     [string] $SymPath = 'srv*C:\Symbols*https://symweb.azurefd.net',
     [string] $Cdb                                           # cdb.exe; auto-detect Store WinDbg if omitted
@@ -81,11 +85,191 @@ if (!(Test-Path $Dump)) { throw "dump not found: $Dump" }
 if (-not $Cdb) {
     $Cdb = (Get-Item 'C:\Program Files\WindowsApps\Microsoft.WinDbg.*_x64__8wekyb3d8bbwe\amd64\cdb.exe' -ErrorAction SilentlyContinue |
             Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName)
+    if (-not $Cdb) {
+        $pkg = Get-AppxPackage '*WinDbg*' -ErrorAction SilentlyContinue | Sort-Object InstallLocation | Select-Object -Last 1
+        if ($pkg -and $pkg.InstallLocation) {
+            $candidate = Join-Path $pkg.InstallLocation 'amd64\cdb.exe'
+            if (Test-Path -LiteralPath $candidate) { $Cdb = $candidate }
+        }
+    }
 }
 if (-not $Cdb -or !(Test-Path $Cdb)) { throw "cdb.exe not found - pass -Cdb <path> (Store WinDbg amd64\cdb.exe)" }
 
 $console = [System.IO.Path]::ChangeExtension($OutWds, 'console.txt')
 Write-Host "[gen_task_sweep] cdb  : $Cdb"
+
+if ($RunPerThread) {
+    if ($PerThreadTimeoutSec -le 0) { throw "-PerThreadTimeoutSec must be > 0" }
+    $runDir = Join-Path (Split-Path -Parent $OutWds) ([System.IO.Path]::GetFileNameWithoutExtension($OutWds) + '_per_thread')
+    New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+    if (Test-Path -LiteralPath $LogFile) { Remove-Item -LiteralPath $LogFile -Force }
+    $summary = New-Object System.Collections.ArrayList
+    foreach ($t in $threadList) {
+        $parts = $t -split ':', 2
+        $tid  = $parts[0].Trim()
+        $role = if ($parts.Count -gt 1 -and $parts[1].Trim()) { $parts[1].Trim() } else { 'MAIN' }
+        $safeRole = ($role -replace '[^A-Za-z0-9_.-]', '_')
+        $oneLog = Join-Path $runDir ("{0}_{1}.txt" -f $tid, $safeRole)
+        $oneWds = Join-Path $runDir ("{0}_{1}.wds" -f $tid, $safeRole)
+        $oneConsole = [System.IO.Path]::ChangeExtension($oneWds, 'console.txt')
+        $oneErr = [System.IO.Path]::ChangeExtension($oneWds, 'err.txt')
+        $one = New-Object System.Text.StringBuilder
+        [void]$one.AppendLine(".logopen $oneLog")
+        [void]$one.AppendLine("~$tid s ; .echo ===TASK_$tid $role=== ; !dscript.run $js")
+        [void]$one.AppendLine(".echo ===END_TASK_$tid===")
+        [void]$one.AppendLine(".logclose")
+        [void]$one.AppendLine("q")
+        [System.IO.File]::WriteAllText($oneWds, $one.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+
+        Write-Host ("[gen_task_sweep] run-per-thread: TID {0} {1}" -f $tid, $role)
+        $proc = Start-Process -FilePath $Cdb -ArgumentList @('-y', $SymPath, '-z', $Dump, '-c', "`$`$><$oneWds", '-G', '-lines') -RedirectStandardOutput $oneConsole -RedirectStandardError $oneErr -WindowStyle Hidden -PassThru
+        $completed = $false
+        $reachedEnd = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds($PerThreadTimeoutSec)
+        do {
+            if ($proc.WaitForExit(1000)) { $completed = $true; break }
+            if ((Test-Path -LiteralPath $oneLog) -and (Select-String -LiteralPath $oneLog -Pattern "===END_TASK_$tid===" -Quiet)) {
+                $reachedEnd = $true
+                break
+            }
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if (-not $completed -and $reachedEnd) {
+            try { $proc.Kill() } catch {}
+            $completed = $true
+            Write-Host ("[gen_task_sweep] TID {0} reached end marker but cdb stayed open; killed prompt" -f $tid) -ForegroundColor Yellow
+        }
+        if (-not $completed) {
+            try { $proc.Kill() } catch {}
+            $bytes = 0
+            if (Test-Path -LiteralPath $oneLog) {
+                $bytes = (Get-Item -LiteralPath $oneLog).Length
+                if ($bytes -gt 0) {
+                    Get-Content -LiteralPath $oneLog -Raw -Encoding UTF8 | Add-Content -LiteralPath $LogFile -Encoding UTF8
+                } else {
+                    Add-Content -LiteralPath $LogFile -Encoding UTF8 -Value "===TASK_$tid $role==="
+                }
+            } else {
+                Add-Content -LiteralPath $LogFile -Encoding UTF8 -Value "===TASK_$tid $role==="
+            }
+            Add-Content -LiteralPath $LogFile -Encoding UTF8 -Value "DSCRIPT_TIMEOUT script=$Script timeoutSec=$PerThreadTimeoutSec"
+            if (-not ((Test-Path -LiteralPath $oneLog) -and (Select-String -LiteralPath $oneLog -Pattern "===END_TASK_$tid===" -Quiet))) {
+                Add-Content -LiteralPath $LogFile -Encoding UTF8 -Value "===END_TASK_$tid==="
+            }
+            [void]$summary.Add([ordered]@{ tid=[int]$tid; role=$role; status='timeout'; bytes=$bytes; log=$oneLog; console=$oneConsole })
+            Write-Host ("[gen_task_sweep] TID {0} TIMEOUT after {1}s" -f $tid, $PerThreadTimeoutSec) -ForegroundColor Yellow
+            continue
+        }
+        $status = 'empty'
+        $bytes = 0
+        if (Test-Path -LiteralPath $oneLog) {
+            $bytes = (Get-Item -LiteralPath $oneLog).Length
+            if ($bytes -gt 0) {
+                Get-Content -LiteralPath $oneLog -Raw -Encoding UTF8 | Add-Content -LiteralPath $LogFile -Encoding UTF8
+                $status = 'done'
+            }
+        }
+        [void]$summary.Add([ordered]@{ tid=[int]$tid; role=$role; status=$status; bytes=$bytes; log=$oneLog; console=$oneConsole })
+        Write-Host ("[gen_task_sweep] TID {0} {1} ({2} bytes)" -f $tid, $status, $bytes)
+    }
+    Add-Content -LiteralPath $LogFile -Encoding UTF8 -Value "##### END TASK.JS SWEEP #####"
+    $summaryPath = [System.IO.Path]::ChangeExtension($OutWds, 'summary.json')
+    [System.IO.File]::WriteAllText($summaryPath, ($summary | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    $n = 0
+    if (Test-Path $LogFile) { $n = (Select-String $LogFile -Pattern '(?m)^===TASK_').Count }
+    Write-Host ""
+    Write-Host "[gen_task_sweep] done. task blocks in log: $n  (expected $($threadList.Count))"
+    Write-Host "[gen_task_sweep] log     -> $LogFile"
+    Write-Host "[gen_task_sweep] summary -> $summaryPath"
+    exit 0
+}
+
+if ($ShardSize -gt 0) {
+    if ($ShardTimeoutSec -le 0) { throw "-ShardTimeoutSec must be > 0" }
+    $runDir = Join-Path (Split-Path -Parent $OutWds) ([System.IO.Path]::GetFileNameWithoutExtension($OutWds) + '_shards')
+    New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+    if (Test-Path -LiteralPath $LogFile) { Remove-Item -LiteralPath $LogFile -Force }
+    $summary = New-Object System.Collections.ArrayList
+    $shardIndex = 0
+    for ($start = 0; $start -lt $threadList.Count; $start += $ShardSize) {
+        $shardIndex++
+        $end = [Math]::Min($start + $ShardSize - 1, $threadList.Count - 1)
+        $slice = @($threadList[$start..$end])
+        $oneLog = Join-Path $runDir ("shard_{0:000}.txt" -f $shardIndex)
+        $oneWds = Join-Path $runDir ("shard_{0:000}.wds" -f $shardIndex)
+        $oneConsole = [System.IO.Path]::ChangeExtension($oneWds, 'console.txt')
+        $oneErr = [System.IO.Path]::ChangeExtension($oneWds, 'err.txt')
+        $one = New-Object System.Text.StringBuilder
+        [void]$one.AppendLine(".logopen $oneLog")
+        foreach ($t in $slice) {
+            $parts = $t -split ':', 2
+            $tid  = $parts[0].Trim()
+            $role = if ($parts.Count -gt 1 -and $parts[1].Trim()) { $parts[1].Trim() } else { 'MAIN' }
+            [void]$one.AppendLine("~$tid s ; .echo ===TASK_$tid $role=== ; !dscript.run $js")
+        }
+        [void]$one.AppendLine(".echo ##### END TASK.JS SHARD $shardIndex #####")
+        [void]$one.AppendLine(".logclose")
+        [void]$one.AppendLine("q")
+        [System.IO.File]::WriteAllText($oneWds, $one.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+
+        Write-Host ("[gen_task_sweep] run-shard {0}: {1} threads" -f $shardIndex, $slice.Count)
+        $proc = Start-Process -FilePath $Cdb -ArgumentList @('-y', $SymPath, '-z', $Dump, '-c', "`$`$><$oneWds", '-G', '-lines') -RedirectStandardOutput $oneConsole -RedirectStandardError $oneErr -WindowStyle Hidden -PassThru
+        $completed = $false
+        $reachedEnd = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds($ShardTimeoutSec)
+        do {
+            if ($proc.WaitForExit(1000)) { $completed = $true; break }
+            $blockCount = if (Test-Path -LiteralPath $oneLog) { (Select-String -LiteralPath $oneLog -Pattern '^===TASK_' | Measure-Object).Count } else { 0 }
+            $hasEnd = if (Test-Path -LiteralPath $oneLog) { [bool](Select-String -LiteralPath $oneLog -Pattern "END TASK\.JS SHARD $shardIndex" -Quiet) } else { $false }
+            if ($blockCount -ge $slice.Count -and $hasEnd) {
+                $reachedEnd = $true
+                break
+            }
+        } while ([DateTime]::UtcNow -lt $deadline)
+        $blockCount = if (Test-Path -LiteralPath $oneLog) { (Select-String -LiteralPath $oneLog -Pattern '^===TASK_' | Measure-Object).Count } else { 0 }
+        $hasEnd = if (Test-Path -LiteralPath $oneLog) { [bool](Select-String -LiteralPath $oneLog -Pattern "END TASK\.JS SHARD $shardIndex" -Quiet) } else { $false }
+        if (-not $completed -and ($reachedEnd -or ($blockCount -ge $slice.Count -and $hasEnd))) {
+            try { $proc.Kill() } catch {}
+            $completed = $true
+            Write-Host ("[gen_task_sweep] shard {0} reached end marker but cdb stayed open; killed prompt" -f $shardIndex) -ForegroundColor Yellow
+        }
+        if (-not $completed) {
+            try { $proc.Kill() } catch {}
+            if (Test-Path -LiteralPath $oneLog) {
+                Get-Content -LiteralPath $oneLog -Raw -Encoding UTF8 | Add-Content -LiteralPath $LogFile -Encoding UTF8
+            }
+            Add-Content -LiteralPath $LogFile -Encoding UTF8 -Value "##### DSCRIPT_SHARD_TIMEOUT shard=$shardIndex timeoutSec=$ShardTimeoutSec blocks=$blockCount/$($slice.Count) #####"
+            foreach ($t in $slice) {
+                $parts = $t -split ':', 2
+                $tid  = $parts[0].Trim()
+                $role = if ($parts.Count -gt 1 -and $parts[1].Trim()) { $parts[1].Trim() } else { 'MAIN' }
+                [void]$summary.Add([ordered]@{ tid=[int]$tid; role=$role; shard=$shardIndex; status='shard-timeout'; blocks=$blockCount; log=$oneLog; console=$oneConsole })
+            }
+            Write-Host ("[gen_task_sweep] shard {0} TIMEOUT after {1}s; blocks={2}/{3}" -f $shardIndex, $ShardTimeoutSec, $blockCount, $slice.Count) -ForegroundColor Yellow
+        } else {
+            if (Test-Path -LiteralPath $oneLog) {
+                Get-Content -LiteralPath $oneLog -Raw -Encoding UTF8 | Add-Content -LiteralPath $LogFile -Encoding UTF8
+            }
+            foreach ($t in $slice) {
+                $parts = $t -split ':', 2
+                $tid  = $parts[0].Trim()
+                $role = if ($parts.Count -gt 1 -and $parts[1].Trim()) { $parts[1].Trim() } else { 'MAIN' }
+                [void]$summary.Add([ordered]@{ tid=[int]$tid; role=$role; shard=$shardIndex; status='done'; log=$oneLog; console=$oneConsole })
+            }
+            Write-Host ("[gen_task_sweep] shard {0} done; blocks={1}/{2}" -f $shardIndex, $blockCount, $slice.Count)
+        }
+    }
+    Add-Content -LiteralPath $LogFile -Encoding UTF8 -Value "##### END TASK.JS SWEEP #####"
+    $summaryPath = [System.IO.Path]::ChangeExtension($OutWds, 'summary.json')
+    [System.IO.File]::WriteAllText($summaryPath, ($summary | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    $n = 0
+    if (Test-Path $LogFile) { $n = (Select-String $LogFile -Pattern '(?m)^===TASK_').Count }
+    Write-Host ""
+    Write-Host "[gen_task_sweep] done. task blocks in log: $n  (expected $($threadList.Count))"
+    Write-Host "[gen_task_sweep] log     -> $LogFile"
+    Write-Host "[gen_task_sweep] summary -> $summaryPath"
+    exit 0
+}
+
 Write-Host "[gen_task_sweep] run  : -y '$SymPath' -z '$Dump' -c `"`$`$><$OutWds`""
 # -y = symbols (never .sympath in -c); $$>< = BLOCK mode (the .wds has many lines / $$ comments)
 & $Cdb -y $SymPath -z $Dump -c "`$`$><$OutWds" *> $console

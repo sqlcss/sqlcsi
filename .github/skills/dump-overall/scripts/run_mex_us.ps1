@@ -40,7 +40,11 @@ if (-not $Cdb) {
     )
     $wdbg = (Get-AppxPackage *WinDbg* -ErrorAction SilentlyContinue | Select-Object -First 1).InstallLocation
     if ($wdbg) { $cand += (Join-Path $wdbg 'amd64\cdb.exe') }
-    $Cdb = ($cand | Where-Object { $_ -and (Test-Path $_) })[0]
+    try {
+        $glob = Get-ChildItem "${env:ProgramFiles}\WindowsApps\Microsoft.WinDbg*_x64_*\amd64\cdb.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+        if ($glob) { $cand += $glob.FullName }
+    } catch {}
+    $Cdb = @($cand | Where-Object { $_ -and (Test-Path $_) })[0]
 }
 if (-not $Cdb -or -not (Test-Path $Cdb)) {
     Write-Host "[run_mex_us] ERROR: cdb.exe not found — install Windows Kits Debuggers or WinDbg Store package" -ForegroundColor Red

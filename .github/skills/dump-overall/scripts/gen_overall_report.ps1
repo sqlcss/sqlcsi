@@ -49,7 +49,8 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory)][string]$Manifest,
-  [Parameter(Mandatory)][string]$Out
+    [Parameter(Mandatory)][string]$Out,
+    [string]$Ledger
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,6 +70,16 @@ try {
 if (-not $m.caseId) {
     Write-Host "[gen_overall_report] ERROR: manifest.caseId is required" -ForegroundColor Red
     exit 1
+}
+
+if ($Ledger) {
+    $verifier = Join-Path $PSScriptRoot 'verify_case_deliverables.ps1'
+    $outDirForVerify = Split-Path -Parent $Out
+    & $verifier -CaseId ([string]$m.caseId) -OutDir $outDirForVerify -Stage PreReport -Ledger $Ledger
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[gen_overall_report] ERROR: pre-report ledger verification failed" -ForegroundColor Red
+        exit 1
+    }
 }
 
 function HE([string]$s) {

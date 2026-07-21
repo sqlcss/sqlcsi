@@ -6,7 +6,7 @@ description: >-
   subsystem state; falls back to native symbol/stack walking when mirrors are
   unavailable. Use when the user says "analyze dump", "分析 dump", provides a
   .mdmp file path, or asks to generate WinDbg commands for a SQL Server dump.
-tools: ['terminal', 'readFile', 'editFile', 'createFile']
+tools: [read, edit, search, execute]
 ---
 
 # Dump Analysis Agent
@@ -22,15 +22,31 @@ in sequence. Two analysis surfaces:
 
 ## Skill Reference
 
-Read the full methodology from:
-[.github/skills/dump-analysis/SKILL.md](../skills/dump-analysis/SKILL.md)
+The methodology is split across three files — read them in this order:
 
-- **Part 1** (Steps 1–4): cdb.exe setup, subsystem→script mapping, error-specific
-  LINQ queries, result parsing, cdb CLI reference, DX frame/locals inspection.
-- **Part 2** (Methods 1–5): scheduler/worker/task extraction, latch timeout decode,
-  non-yield analysis, thread categorization, SQLOS enum resolution.
+1. **Setup (single source)** —
+   [.github/skills/dump-overall/reference/setup.md](../skills/dump-overall/reference/setup.md):
+   Symbol Path, Step 0 Pre-Check (5-surface tool inventory + install prompts), Step 1
+   Session Setup (cdb resolution + DScript COM registration + Path A/B), and the Step 1
+   fallback (mirror-404 build-share load). **Both the `dump-overall` and `dump-analysis`
+   skills link here — do setup here FIRST, once.**
+2. **Global snapshot (run FIRST)** —
+   [.github/skills/dump-overall/SKILL.md](../skills/dump-overall/SKILL.md): the
+   DumpViewer-first overall pass (分析第零步 DumpViewer.exe → 第一步 thread inventory /
+   state stats → 第二步 exec-statement threads → 附加步骤 ring buffers). Produces the
+   problem-independent picture that decides *which* subsystem to open next.
+3. **Root-cause deep-dive (run AFTER overall)** —
+   [.github/skills/dump-analysis/SKILL.md](../skills/dump-analysis/SKILL.md): 深挖第一步
+   (subsystem focus) + 深挖第二步 (parse findings). Its 第一步/第二步 are delegated to the
+   `dump-overall` skill (do NOT re-run them here).
 
-Deep, source-grounded methods live in reference files (read on demand):
+- **Part 1** (SKILL.md): subsystem→script mapping, error-specific LINQ queries, result
+  parsing, cdb CLI reference, DX frame/locals inspection.
+- **Part 2** (SKILL.md Methods 1–5): scheduler/worker/task extraction, latch timeout
+  decode, non-yield analysis, thread categorization, SQLOS enum resolution.
+
+Deep, source-grounded routines live in reference files — **routed by the dump's routine
+after the overall pass** (read on demand):
 - [.github/skills/dump-analysis/reference/latch_timeout.md](../skills/dump-analysis/reference/latch_timeout.md) — latch timeout (`m_count` decode, waiter-list walk, self-wait detection)
 - [.github/skills/dump-analysis/reference/non_yielding.md](../skills/dump-analysis/reference/non_yielding.md) — non-yielding / stall (`pTrack`, copied-stack `.cxr`)
 
@@ -57,14 +73,14 @@ Activate when the user:
 
 ## Orchestration Steps
 
-### Phase 0: Path & Surface Selection
+### Phase 0: Setup & Surface Selection
 
-**First run the tooling Pre-Check** (SKILL.md §Step 0). Verify **WinDbgCsExt**
-(cdb mirror extension) and **DumpViewer + SqlScriptRepl** (self-hosted REPL) are
-installed. If a required surface is **missing, STOP and prompt the user to install
-it** using the Step 0 install prompts — do NOT silently fall through to a broken path.
-Never copy `DumpViewer.exe` into the `WinDbgCs.amd64` folder (they are different
-tools; each must stay self-contained).
+**First do the setup in [reference/setup.md](../skills/dump-overall/reference/setup.md)**
+(Symbol Path → Step 0 Pre-Check → Step 1 Session Setup). Ask the user for the tool paths
+(never auto-guess), then run the Pre-Check to verify the 5 surfaces. If a required surface
+is **missing, STOP and prompt the user to install it** using setup.md's install prompts —
+do NOT silently fall through to a broken path. Never copy `DumpViewer.exe` into the
+`WinDbgCs.amd64` folder (they are different tools; each must stay self-contained).
 
 ```
 IF dump_path provided AND cdb.exe reachable → Path A (cdb.exe CLI, preferred)
@@ -73,12 +89,12 @@ ELSE IF user pastes WinDbg output → jump to Phase 3 (Parse Results)
 ELSE → ask user which path to use
 ```
 
-Verify cdb.exe (SKILL.md §Step 1.1). Default to **Part 1 (Mirrors)**; switch to
+Verify cdb.exe (setup.md §Step 1.1). Default to **Part 1 (Mirrors)**; switch to
 **Part 2 (native walking)** when `!dcs_initsymsvr` fails, mirrors don't load, the
 build is unsupported (e.g. SQL 2019), or the dump is a latch-timeout / non-yield
 dump where stack-local walking is more direct.
 
-**Symbol path** (SKILL.md §Symbol Path): always use the machine's `_NT_SYMBOL_PATH`
+**Symbol path** (setup.md §Symbol Path): always use the machine's `_NT_SYMBOL_PATH`
 — on this workstation `srv*C:\Symbols*https://symweb.azurefd.net` (internal symweb has
 SQL private PDBs **and** the SqlCsScripts/Mirrors packages). **Do NOT hardcode
 `https://msdl.microsoft.com/download/symbols`** — the public store has neither.
@@ -136,49 +152,53 @@ persists machine-wide in HKLM and **every later run is non-elevated (no UAC)**.
 > If `Test-Path 'HKLM:\SOFTWARE\Classes\CLSID\...'` already shows 4 DScript CLSIDs,
 > **skip steps 2–3** and use the scripts directly — no UAC.
 
-### Phase 1: Triage
+### Phase 1: Overall Snapshot (run the `dump-overall` skill FIRST)
 
-Run the triage script from SKILL.md §Multi-Phase Pattern (Phase 1):
-dump metadata + uptime + ProcessSummary + exception ring buffer top 50.
+**Run the `dump-overall` skill before any subsystem work.** It is the
+problem-independent global pass and follows its own Canonical Run Order (P1–P4 pause
+gates): 分析第零步 DumpViewer.exe → 第一步 thread inventory + SQLOS worker-state + task-level
+`Tasks.Enumerate` + per-scheduler distribution → 第二步 exec-statement threads +
+blocking-chain → 附加步骤 ring buffers. Read
+[.github/skills/dump-overall/SKILL.md](../skills/dump-overall/SKILL.md).
 
-```
-cdb -z {dump} -G -logo reports/{case_id}_triage.txt -cf reports/{case_id}_triage.cdb
-```
+The overall output tells you **which subsystem to open and which routine the dump is** —
+that decision drives Phase 2 routing. Do NOT skip ahead to a subsystem deep-dive before
+the overall snapshot is done; the thread inventory + state stats + exec-statement table
+are prerequisites for a defensible root cause.
 
-Parse output → extract error numbers, subsystem hint, top call-stack functions.
+### Phase 2: Subsystem Deep Dive — route by the dump's routine
 
-### Phase 2: Subsystem Deep Dive
-
-Use SKILL.md §Step 2 (subsystem→script mapping) and §Step 3 (error-specific
-queries) to build a `{case_id}_deepdive.cdb` script, then run it.
+Using the overall snapshot, pick the subsystem and route into the matching deep-dive
+routine (SKILL.md §深挖第一步 subsystem→script mapping + error-specific queries), then
+build a `{case_id}_deepdive.cdb` script and run it.
 
 - **Mirrors available** → Part 1 deep-dive blocks (HADR / Memory / Scheduler / Locking).
 - **Mirrors unavailable** → Part 2 native methods:
-  - Latch timeout → Method 2 (`m_count` decode + waiter-list walk + **walk the EX
-    owner's real stack** to find why it won't release — log/data IO, preemptive, etc.;
-    the latch timeout is usually a symptom). ⚠️ In minidumps trust the owner thread
-    stack, NOT the stale `SOS_Task.m_State`/`m_LastWaitType` fields.
-    Read [reference/latch_timeout.md](../skills/dump-analysis/reference/latch_timeout.md) first.
-  - Non-yield / 17883 / 17884 → Method 3 (`pTrack` + copied-stack `.cxr`).
-    Read [reference/non_yielding.md](../skills/dump-analysis/reference/non_yielding.md) first.
+  - **Latch timeout** → **read [reference/latch_timeout.md](../skills/dump-analysis/reference/latch_timeout.md) FIRST**, then Method 2
+    (`m_count` decode + waiter-list walk + **walk the EX owner's real stack** to find why
+    it won't release — log/data IO, preemptive, etc.; the latch timeout is usually a
+    symptom). ⚠️ In minidumps trust the owner thread stack, NOT the stale
+    `SOS_Task.m_State`/`m_LastWaitType` fields.
+  - **Non-yield / 17883 / 17884** → **read [reference/non_yielding.md](../skills/dump-analysis/reference/non_yielding.md) FIRST**, then Method 3
+    (`pTrack` + copied-stack `.cxr`).
   - "What is every thread doing?" → Method 4 (`!uniqstack` + categorization).
   - Scheduler/worker enumeration → Method 1; enum names → Method 5.
 
 ### Phase 3: Targeted Follow-up & Parse Results
 
 Run specific queries for task addresses / session IDs found in Phase 2
-(SKILL.md §Step 4). For deep frame inspection use the DX frame/locals technique
+(SKILL.md §深挖第二步). For deep frame inspection use the DX frame/locals technique
 (SKILL.md §Inspecting Per-Frame Local Variables).
 
 ### Phase 4: Compile Findings
 
-Write findings per SKILL.md §Step 4.4 → `reports/{case_id}_dump_findings.md`.
+Write findings per SKILL.md §深挖第二步 (4.4 Compile Findings) → `reports/{case_id}_dump_findings.md`.
 Return structured `DUMP_FINDINGS` (errors / call_stack_functions / server_state)
 for downstream source-code search.
 
 ## Output Files
 
-1. `reports/{case_id}_triage.cdb` / `_triage.txt` — triage script + raw output
+1. `reports/{case_id}_dump_code_analysis/` + `dumpviewer_out/` — overall snapshot outputs from the `dump-overall` skill (Phase 1)
 2. `reports/{case_id}_deepdive.cdb` / `_deepdive.txt` — deep-dive script + output
 3. `reports/{case_id}_dump_findings.md` — parsed findings report
 
