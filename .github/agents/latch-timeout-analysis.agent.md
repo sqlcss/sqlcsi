@@ -68,17 +68,63 @@ From ERRORLOG `***Stack Dump being sent to ...SQLDump{NNNN}.txt`:
   - input-buffer SQL and XEvent summary
 - Invoke the `dump-analysis` agent with that context
 - Require `dump-analysis` to run `dump-overall` first and pass the dump-overall verifier
+  with latch dump hard gates enabled: `-RequireSchedulerInventory` and
+  `-RequireLatchContendedPages`
 - Require the latch-native dump deep-dive to follow
   `.github/skills/dump-analysis/reference/latch_timeout.md`
+- Treat the dump handoff as incomplete until `dump-analysis` returns a latch-native
+  evidence summary with owner/waiter mapping, latch `m_count`, owner real stack,
+  self-blocking vs cross-session/chain classification, and minidump limitations.
 
 Do not run DumpViewer, cdb, WinDbgCs, or DScript directly in this agent after
 delegating. `dump-analysis` owns dump command execution and report generation.
 
 ### 7. Synthesize Findings
-Combine:
-- **ERRORLOG**: latch class, SPID, SQL text, timeline
-- **XEvent**: CPU pressure, wait profile, QUERY_PROCESSING warnings, AG events
-- **Dump**: `dump-analysis` report paths, dump-overall PASS result, call stacks,
-  owning task state, memory state
+**Mandatory final-report gate when a dump exists:** do not generate or mark the final
+`{case_id}_latch_timeout_{lang}.html|md` report complete until Step 6 has returned:
 
-Produce root cause summary using the template in the skill file.
+- dump-overall verifier status and report path
+- latch-native dump evidence from `dump-analysis/reference/latch_timeout.md`
+- raw command or DumpViewer evidence paths supporting the native conclusion
+- explicit minidump/full-dump limitation note
+
+The final report must cover the complete five-step evidence chain, not only the dump:
+
+1. **ERRORLOG 定位问题**: latch class, latch id/address, waiters, owner task, SPID,
+  input SQL, timeout timeline.
+2. **XEvent 环境背景**: CPU, scheduler, waits, query processing, memory, IO, HADR,
+  and a system-pressure participation verdict.
+3. **dump-overall 全局快照**: all threads, task state, process_commands / `task.js` /
+  `tsqlstack`, ring buffers, and verifier PASS.
+4. **latch-native dump 证据**: owner / waiter / `m_count`, owner real stack,
+  self-blocking vs cross-session/chain classification, minidump limitations.
+5. **Synthesized conclusion**: root cause, most likely mechanism, confidence, and
+  evidence mapping.
+
+If the dump exists but latch-native evidence cannot be produced, stop and write a
+partial-analysis limitation instead of producing a complete final report.
+
+After writing the final report, run the latch report verifier with dump evidence
+required. The task is not complete unless this verifier passes:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\latch-timeout-analysis\scripts\verify_latch_report.ps1 `
+  -CaseId '{case_id}' `
+  -ReportDir 'C:\Users\lduan\sqlcsi-archive\reports\{case_id}_{brief}' `
+  -ReportPath '{case_id}_latch_timeout_{lang}.html' `
+  -Ledger 'C:\Users\lduan\sqlcsi-archive\reports\{case_id}_{brief}\workflow_ledger.json' `
+  -RequireDumpEvidence
+```
+
+Combine:
+- **ERRORLOG**: latch class, latch id/address, waiters, owner task, SPID, SQL text, timeline
+- **XEvent**: CPU pressure, scheduler, waits, QUERY_PROCESSING warnings, memory, IO, HADR,
+  and system-pressure verdict
+- **Dump overall**: `dump-analysis` report paths, dump-overall PASS result, global
+  thread/task/SQL/ring-buffer snapshot, process_commands / `task.js` / `tsqlstack`
+- **Latch-native dump deep-dive**: owner/waiter table, latch `m_count`, owner real
+  stack, self-blocking vs cross-session/chain verdict, minidump limitations
+- **Synthesis**: root cause / most likely mechanism, confidence, and evidence mapping
+
+Produce the synthesized root-cause summary using the template in the skill file,
+including confidence and evidence mapping.

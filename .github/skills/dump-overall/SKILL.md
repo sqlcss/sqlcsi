@@ -164,6 +164,11 @@ decodes the running T-SQL, producing a multi-section snapshot **（纯列举，�
 | 13 | **DoD Gate** | Paste + tick the DEFINITION-OF-DONE checklist | — mandatory self-check, **not a pause** |
 | 13 | **Report Generation** | Assemble the fixed artifact set («Fixed artifact set & structure») | ⏸️ **P4** — ASK **language (English / 中文)** + **format (HTML / Markdown)**, THEN write the report. |
 
+> **Latch dump hard gate:** for latch-timeout or latch/page-contention dumps, the DoD verifier
+> must include `-RequireSchedulerInventory -RequireLatchContendedPages`. DumpViewer latch pages
+> are optional side evidence and do not replace `sys.schedulers.js` / `Schedulers.Enumerate` or
+> `dump_latch_contended_pages.js` output.
+
 ### 固化脚本执行清单 · Stabilized script runbook
 
 The table above is the workflow contract; the concrete script chain below is the stable path
@@ -1137,7 +1142,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\
 ```
 
 > **Completion gate:** the scheduler inventory raw file must be non-empty. For the DScript path,
-> `{case_id}_sys.schedulers.txt` must contain `END SYS.SCHEDULERS`.
+> `{case_id}_sys.schedulers.txt` must contain `END SYS.SCHEDULERS`. After running
+> `inject_dscript_inventory_sections.ps1`, the MAIN report must include a parsed
+> `Scheduler detail` table with the row-level `sys.schedulers.js` result, not only a
+> summary count or raw txt link.
 
 > 采集方式：`!execute Schedulers.Enumerate`（SqlScriptRepl / mirror）**或** `sys.schedulers.js`
 > （cdb `-c "$$><file; q"` / SqlScriptRepl `!dscript.run`）。两者列的语义等价（≈ `sys.dm_os_schedulers`）。
@@ -1242,6 +1250,17 @@ thread ID 列表**；**（6.2）** 把 6.1 返回的每个 **thread ID** 拿去*
 > 该页的 thread ID 以 chip 列出；每个 chip **链接**到第一步对应线程的完整栈锚点（PRIMARY）或内联/补齐
 > 的栈块（FALLBACK）——**链接而非重印**。保持与第四/五步一致的「纯客观列举」风格。
 
+> **Completion gate:** for latch-timeout dumps, `{case_id}_dump_latch_contended_pages.txt`
+> must exist, be non-empty, and contain `END LATCH CONTENDED PAGES`. `No pages found` is
+> acceptable only as raw evidence emitted by this script; missing script output is not acceptable.
+> After scheduler and latch-contended-pages DScript outputs are generated, the standard
+> `finalize_ringbuf_reports.ps1` automatically runs `inject_dscript_inventory_sections.ps1`
+> so the MAIN overall report includes the 第四步 and 第六步 sections. The 第四步 section must
+> include parsed scheduler detail rows, and the 第六步 section must include the parsed `Page | Count | Threads`
+> detail rows from `{case_id}_dump_latch_contended_pages.txt` (for example,
+> `1:9 | 4 | ~217, ~226, ~256, ~394`), not just a raw txt link. The verifier checks both
+> the raw files and the MAIN report links/sections/detail rows.
+
 ---
 
 ## SchedulerMonitor 环形缓冲 —— 已并入附加步骤（第 5 条），不再单独成段
@@ -1306,7 +1325,7 @@ carry-forward captures here for downstream reuse: `{case}_us.txt`, `{case}_tasks
 When the acquisition path is `run_windbgcs_direct.ps1`, its output is one combined log with
 `== MARKER_<expr> ==` fences. **Do not link that combined log, or a `direct_mirror.html` wrapper
 around it, as the ring-buffer result.** Run the committed finalizer; it performs split → build →
-verify in one call:
+inject scheduler/latch DScript sections → verify in one call:
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\finalize_ringbuf_reports.ps1 `
@@ -1315,8 +1334,15 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\script
   -TopN   20 `
   -RequireThreadCategories `
   -RequireSqlExec `
-  -RequireSchedulerInventory
+  -RequireSchedulerInventory `
+  -RequireLatchContendedPages
 ```
+
+For non-latch dump routines, omit `-RequireLatchContendedPages`. For latch-timeout or
+latch/page-contention dumps, keep both scheduler and latch-page switches enabled. When both
+`{case_id}_sys.schedulers.txt` and `{case_id}_dump_latch_contended_pages.txt` exist, the
+finalizer automatically calls `inject_dscript_inventory_sections.ps1` before verification, so
+the MAIN report contains the parsed scheduler detail table and `Page | Count | Threads` rows.
 
 The raw direct log may still be linked as evidence, but the MAIN report's 附加步骤 must be the
 parsed/classified view: category histogram, dump-before top 20 rows, rule-based anomaly rows,

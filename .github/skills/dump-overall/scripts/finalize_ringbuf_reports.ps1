@@ -6,7 +6,8 @@
 #   2. Split their `== MARKER_<expr> ==` sections into txt_detail\{case}_{expr}.txt.
 #   3. Run build_ringbuf_reports.ps1 to generate categorized subreports and inject
 #      top-N + anomaly sections into the MAIN overall report.
-#   4. Optionally run verify_case_deliverables.ps1 as the hard gate.
+#   4. Inject scheduler/latch DScript inventory sections into the MAIN report when present.
+#   5. Optionally run verify_case_deliverables.ps1 as the hard gate.
 #
 # Use this instead of manually linking direct_mirror.html/raw txt. Raw logs remain
 # evidence only; the user-facing result is the parsed/classified report section.
@@ -22,7 +23,8 @@ param(
     [switch]$SkipVerify,
     [switch]$RequireThreadCategories,
     [switch]$RequireSqlExec,
-    [switch]$RequireSchedulerInventory
+    [switch]$RequireSchedulerInventory,
+    [switch]$RequireLatchContendedPages
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,8 +36,9 @@ if (-not (Test-Path -LiteralPath $TxtDir -PathType Container)) { New-Item -ItemT
 $splitter = Join-Path $PSScriptRoot 'split_direct_mirror_log.ps1'
 $builder  = Join-Path $PSScriptRoot 'build_ringbuf_reports.ps1'
 $verifier = Join-Path $PSScriptRoot 'verify_case_deliverables.ps1'
+$injector = Join-Path $PSScriptRoot 'inject_dscript_inventory_sections.ps1'
 
-foreach ($script in @($splitter,$builder,$verifier)) {
+foreach ($script in @($splitter,$builder,$verifier,$injector)) {
     if (-not (Test-Path -LiteralPath $script -PathType Leaf)) { throw "required helper missing: $script" }
 }
 
@@ -79,6 +82,21 @@ Write-Host "[finalize_ringbuf_reports] build categorized ring-buffer reports fro
     -PageSize $PageSize
 if ($LASTEXITCODE -ne 0) { throw "build_ringbuf_reports.ps1 failed" }
 
+$schedulerLog = Join-Path $Dir "${CaseId}_sys.schedulers.txt"
+$latchPagesLog = Join-Path $Dir "${CaseId}_dump_latch_contended_pages.txt"
+$shouldInjectDscriptInventory = (Test-Path -LiteralPath $schedulerLog -PathType Leaf) -and (Test-Path -LiteralPath $latchPagesLog -PathType Leaf)
+if ($shouldInjectDscriptInventory) {
+    Write-Host "[finalize_ringbuf_reports] inject scheduler/latch DScript sections into MAIN report" -ForegroundColor Cyan
+    & pwsh -NoProfile -ExecutionPolicy Bypass -File $injector `
+        -Dir $Dir `
+        -CaseId $CaseId `
+        -SchedulerLog $schedulerLog `
+        -LatchPagesLog $latchPagesLog
+    if ($LASTEXITCODE -ne 0) { throw "inject_dscript_inventory_sections.ps1 failed" }
+} elseif ($RequireSchedulerInventory -or $RequireLatchContendedPages) {
+    Write-Host "[finalize_ringbuf_reports] scheduler/latch DScript logs are required; verifier will report missing artifacts" -ForegroundColor Yellow
+}
+
 if (-not $SkipVerify) {
     $verifyArgs = @(
         '-NoProfile','-ExecutionPolicy','Bypass','-File',$verifier,
@@ -89,6 +107,7 @@ if (-not $SkipVerify) {
     if ($RequireThreadCategories)    { $verifyArgs += '-RequireThreadCategories' }
     if ($RequireSqlExec)             { $verifyArgs += '-RequireSqlExec' }
     if ($RequireSchedulerInventory)  { $verifyArgs += '-RequireSchedulerInventory' }
+    if ($RequireLatchContendedPages) { $verifyArgs += '-RequireLatchContendedPages' }
     Write-Host "[finalize_ringbuf_reports] run completion verifier" -ForegroundColor Cyan
     & pwsh @verifyArgs
     if ($LASTEXITCODE -ne 0) { throw "verify_case_deliverables.ps1 failed" }

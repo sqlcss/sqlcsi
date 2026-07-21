@@ -412,9 +412,32 @@ If `.mdmp` exists:
 5. Do not run DumpViewer, cdb, WinDbgCs, or DScript commands from this skill after
    delegating. `dump-analysis` owns dump command execution and report generation.
 
-The `dump-analysis` result should return file paths for the overall report,
-dump-overall verifier output, latch native deep-dive report, and any raw command
-evidence needed to support the conclusion.
+### A3.1. Mandatory Dump Handoff Completion Gate
+
+When a matching `.mdmp` exists, the latch workflow is **not complete** until
+`dump-analysis` returns all of the following fields/artifacts:
+
+| Required item | Purpose |
+|---------------|---------|
+| `dump_overall_report` | global dump snapshot path |
+| `dump_overall_verifier` | verifier result; must be PASS before native deep-dive is accepted |
+| `latch_native_report` or `latch_native_summary` | output generated from `dump-analysis/reference/latch_timeout.md` |
+| `owner_waiter_map` | latch address/class, waiter count, EX owner task/thread, owner blocked-on target |
+| `m_count_decode` | mode flags, waiter bit, KP/SH counts, EX/UP/DT flags where readable |
+| `owner_real_stack` | top owner frames, not only the timeout reporter stack |
+| `classification` | self-blocking, cross-session/chain, CPU-starved RUNNABLE owner, IO/log root, or inconclusive |
+| `minidump_limitations` | explicit note for unreadable memory, stale task fields, missing `Tasks.Enumerate`, or partial stack data |
+| `raw_evidence_paths` | DumpViewer/cdb/DScript/log paths supporting the above |
+
+`raw_evidence_paths` may include DumpViewer latch pages, but DumpViewer pages alone
+do **not** satisfy `latch_native_report` / `latch_native_summary` unless a complete
+latch tree is present. If DumpViewer has no usable latch tree, the advanced dump
+evidence must come from native DX/DT commands and the dump-overall DScript outputs
+(`sys.schedulers.js`, `dump_latch_contended_pages.js`).
+
+If any required item is missing, do **not** mark the final latch report complete.
+Either rerun/repair the dump-analysis step or publish only a partial report whose
+status clearly says `Advanced dump evidence unavailable`.
 
 ## A4. Advanced Root Cause Summary
 
@@ -435,6 +458,14 @@ Extends Basic summary (B6) with dump evidence:
 - Wait type: {what was the owner waiting on}
 - Call stack top: {top 5 frames of owner's call stack}
 
+### Latch-Native Dump Evidence (MANDATORY when dump exists)
+- Latch table: {latch | class | #waiters | m_count decode | EX owner task/thread}
+- Waiter map: {waiter thread/task | wait type | stack role | SQL/SPID if known}
+- Owner real stack: {top frames and subsystem meaning}
+- Owner blocked-on target: {same latch / different latch / non-latch IO or preemptive wait / RUNNABLE CPU-starved}
+- Self-blocking vs cross-session/chain verdict: {classification and rationale}
+- Minidump limitations: {unreadable structures, stale task fields, partial output}
+
 ### Scheduler State
 - Scheduler ID: {N}
 - Runnable tasks: {count — high = CPU contention}
@@ -447,8 +478,53 @@ Extends Basic summary (B6) with dump evidence:
 - Stolen memory: {from memory clerk breakdown}
 
 ### Confirmed Root Cause
-{Synthesized from Basic + Advanced evidence with confidence level}
+{Synthesized from Basic + XEvent + dump-overall + latch-native evidence with confidence level}
+
+### Evidence Mapping
+| Claim | Supporting evidence | Confidence | Limitation |
+|-------|---------------------|------------|------------|
+| {root-cause claim} | {ERRORLOG/XEvent/dump-overall/latch-native paths} | {High/Medium/Low} | {known gaps} |
 ```
+
+### A4.1. Final Report Completion Rule
+
+The final `{case_id}_latch_timeout_{lang}.html|md` report is the orchestrator's
+synthesis report. It must be generated **after** Basic ERRORLOG analysis, XEvent
+analysis, dump-overall verification, and latch-native dump deep-dive complete.
+
+Required final-report sections when a dump exists:
+
+1. ERRORLOG evidence: latch class, latch id/address, waiters, owner task, SPID,
+  input SQL, and timeout timeline.
+2. XEvent evidence: CPU, scheduler, waits, query processing, memory, IO, and HADR
+  context, plus an explicit verdict on whether system-level pressure participated.
+3. Dump-overall evidence: all-thread inventory, task state, process_commands / `task.js`
+  / `tsqlstack` execution context, ring buffers, and verifier PASS status.
+4. Latch-native dump evidence from `dump-analysis/reference/latch_timeout.md`: owner /
+  waiter / `m_count`, owner real stack, self-blocking vs cross-session/chain verdict,
+  and minidump/full-dump limitations.
+5. Synthesized conclusion: root cause, most likely mechanism, confidence, and evidence
+  mapping across ERRORLOG / XEvent / dump-overall / latch-native evidence.
+
+Do not treat `dump-overall` alone as the advanced dump conclusion. `dump-overall`
+is a prerequisite snapshot; `latch_timeout.md` supplies the latch-specific native
+evidence needed for the final root-cause claim.
+
+Before marking the case complete, run the final-report verifier:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\latch-timeout-analysis\scripts\verify_latch_report.ps1 `
+  -CaseId '{case_id}' `
+  -ReportDir 'C:\Users\lduan\sqlcsi-archive\reports\{case_id}_{brief}' `
+  -ReportPath '{case_id}_latch_timeout_{lang}.html' `
+  -Ledger 'C:\Users\lduan\sqlcsi-archive\reports\{case_id}_{brief}\workflow_ledger.json' `
+  -RequireDumpEvidence
+```
+
+The verifier must fail when the report omits any required content from the five-step
+chain above. When a workflow ledger is supplied, it must also contain these completed
+steps: `errorlog_latch_context`, `xevent_environment_context`, `dump_overall_snapshot`,
+`latch_native_dump_deep_dive`, and `synthesized_conclusion`.
 
 ---
 

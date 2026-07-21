@@ -12,6 +12,36 @@ SqlCsScripts/Mirrors. Extracted from DumpViewer
 > Symbol path: use `_NT_SYMBOL_PATH` (this machine: `srv*C:\Symbols*https://symweb.azurefd.net`).
 > Do NOT hardcode `msdl.microsoft.com` — symweb (internal) has the SQL private PDBs.
 
+> **DumpViewer latch pages are side evidence only.** Do not use
+> `LatchTimeoutInsight.html`, `LatchListAndTree.html`, or `LatchWaiters.html` as the
+> source of truth for this deep-dive unless they contain a complete latch tree. If
+> DumpViewer does not generate a usable latch tree, the report must say so and use
+> the native flow below: DX enumerate `LatchBase::Suspend`, `dt sqlmin!LatchBase`
+> for `m_count` / owner, owner worker `m_state`, owner real stack, plus the
+> dump-overall `sys.schedulers.js` and `dump_latch_contended_pages.js` outputs.
+> A final latch report that only repeats DumpViewer latch text has not completed
+> this reference workflow.
+
+## Required Step-4 Output Contract
+
+When this reference is invoked by the latch-timeout workflow, return a structured
+`latch_native_summary` with these fields. The final latch report verifier treats
+this as mandatory dump evidence when a `.mdmp` exists:
+
+| Field | Required content |
+|-------|------------------|
+| `owner_waiter_map` | latch address/class, waiter threads/tasks, EX owner task/thread, owner blocked-on target |
+| `m_count_decode` | raw `m_count`, mode bits, waiter bit, EX/UP/DT flags, SH/KP counts where readable |
+| `owner_real_stack` | stack from the owner thread, not just the timeout reporter, with subsystem interpretation |
+| `classification` | self-blocking, cross-session/chain, CPU-starved RUNNABLE owner, IO/log root, or inconclusive |
+| `minidump_limitations` | unreadable memory, missing globals, stale task fields, partial stacks, or why a full dump is needed |
+| `raw_evidence_paths` | cdb / DX / DT / DScript / DumpViewer paths that support each claim |
+
+Do not let Step 4 pass if `owner_waiter_map`, `m_count_decode`, `owner_real_stack`,
+`classification`, or `minidump_limitations` is only implied. Each item must appear
+as an explicit row or subsection in the returned summary and in the final report's
+evidence mapping.
+
 ---
 
 ## Source Objects (DumpViewer classes)

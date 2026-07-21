@@ -26,7 +26,8 @@ param(
     [switch]$RequireOverallAlias,
     [switch]$RequireThreadCategories,
     [switch]$RequireSqlExec,
-    [switch]$RequireSchedulerInventory
+    [switch]$RequireSchedulerInventory,
+    [switch]$RequireLatchContendedPages
 )
 
 $ErrorActionPreference = 'Stop'
@@ -155,6 +156,55 @@ if (-not (Test-Path -LiteralPath $OutDir -PathType Container)) {
                 Add-Failure $failures ("scheduler_inventory: required file missing or empty: {0}" -f (Resolve-CasePath $schedulerFile))
             } elseif ($schedulerFile -like '*sys.schedulers.txt' -and -not (Test-FileContains $schedulerFile 'END SYS.SCHEDULERS')) {
                 Add-Failure $failures "scheduler_inventory: sys.schedulers log missing END SYS.SCHEDULERS marker"
+            }
+            $overall = "${CaseId}_overall_report.html"
+            foreach ($needle in @('第四步 · 调度器清单','sys.schedulers.js',$schedulerFile)) {
+                if (-not (Test-FileContains $overall $needle)) {
+                    Add-Failure $failures "scheduler_inventory: overall report missing '$needle'"
+                }
+            }
+            if ($schedulerFile -like '*sys.schedulers.txt' -and (Test-NonEmptyFile $schedulerFile)) {
+                if (-not (Test-FileContains $overall 'Scheduler detail')) {
+                    Add-Failure $failures "scheduler_inventory: overall report missing Scheduler detail table"
+                }
+                $schedulerRaw = Get-Content -LiteralPath (Resolve-CasePath $schedulerFile) -Raw -Encoding UTF8
+                $schedulerRows = [regex]::Matches($schedulerRaw, '(?m)^\s*(0x[0-9A-Fa-f]+)\s+\d+\s+(\d+)\s+(VISIBLE|HIDDEN)\s+ONLINE\b')
+                foreach ($schedulerRow in $schedulerRows) {
+                    foreach ($needle in @($schedulerRow.Groups[1].Value, $schedulerRow.Groups[2].Value)) {
+                        if (-not (Test-FileContains $overall $needle)) {
+                            Add-Failure $failures "scheduler_inventory: overall report missing scheduler detail '$needle' from $schedulerFile"
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($RequireLatchContendedPages) {
+            $latchPages = "${CaseId}_dump_latch_contended_pages.txt"
+            if (-not (Test-NonEmptyFile $latchPages)) {
+                Add-Failure $failures ("latch_contended_pages: required file missing or empty: {0}" -f (Resolve-CasePath $latchPages))
+            } elseif (-not (Test-FileContains $latchPages 'END LATCH CONTENDED PAGES')) {
+                Add-Failure $failures "latch_contended_pages: log missing END LATCH CONTENDED PAGES marker"
+            }
+            $overall = "${CaseId}_overall_report.html"
+            foreach ($needle in @('第六步 · latch 争用页面清单','dump_latch_contended_pages.js',$latchPages)) {
+                if (-not (Test-FileContains $overall $needle)) {
+                    Add-Failure $failures "latch_contended_pages: overall report missing '$needle'"
+                }
+            }
+            if (Test-NonEmptyFile $latchPages) {
+                $latchRaw = Get-Content -LiteralPath (Resolve-CasePath $latchPages) -Raw -Encoding UTF8
+                $pageRows = [regex]::Matches($latchRaw, '(?m)^\s*(\d+:\d+)\s+(\d+)\s+((?:~\d+\s*,?\s*)+)\s*$')
+                foreach ($pageRow in $pageRows) {
+                    $page = $pageRow.Groups[1].Value
+                    $count = $pageRow.Groups[2].Value
+                    $threads = @($pageRow.Groups[3].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                    foreach ($needle in @($page,$count) + $threads) {
+                        if (-not (Test-FileContains $overall $needle)) {
+                            Add-Failure $failures "latch_contended_pages: overall report missing detail '$needle' from $latchPages"
+                        }
+                    }
+                }
             }
         }
 

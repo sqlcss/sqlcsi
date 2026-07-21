@@ -166,6 +166,11 @@ that decision drives Phase 2 routing. Do NOT skip ahead to a subsystem deep-dive
 the overall snapshot is done; the thread inventory + state stats + exec-statement table
 are prerequisites for a defensible root cause.
 
+For latch-timeout dumps, the overall snapshot is not complete until the dump-overall
+completion verifier passes with `-RequireSchedulerInventory -RequireLatchContendedPages`.
+That gate forces both `sys.schedulers.js` / `Schedulers.Enumerate` and
+`dump_latch_contended_pages.js` output to exist and be linked from the MAIN overall report.
+
 ### Phase 2: Subsystem Deep Dive — route by the dump's routine
 
 Using the overall snapshot, pick the subsystem and route into the matching deep-dive
@@ -177,7 +182,12 @@ build a `{case_id}_deepdive.cdb` script and run it.
   - **Latch timeout** → **read [reference/latch_timeout.md](../skills/dump-analysis/reference/latch_timeout.md) FIRST**, then Method 2
     (`m_count` decode + waiter-list walk + **walk the EX owner's real stack** to find why
     it won't release — log/data IO, preemptive, etc.; the latch timeout is usually a
-    symptom). ⚠️ In minidumps trust the owner thread stack, NOT the stale
+    symptom). Return a latch-native summary containing owner/waiter mapping,
+    `m_count` decode, owner real stack, self-blocking vs cross-session/chain
+    classification, minidump limitations, and raw evidence paths. This summary is the
+    required Step 4 input for the final latch report and must explicitly distinguish
+    owner/waiter/`m_count` evidence, owner real stack evidence, classification, and
+    minidump/full-dump limitations. ⚠️ In minidumps trust the owner thread stack, NOT the stale
     `SOS_Task.m_State`/`m_LastWaitType` fields.
   - **Non-yield / 17883 / 17884** → **read [reference/non_yielding.md](../skills/dump-analysis/reference/non_yielding.md) FIRST**, then Method 3
     (`pTrack` + copied-stack `.cxr`).

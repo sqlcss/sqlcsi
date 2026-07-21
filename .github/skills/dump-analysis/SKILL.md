@@ -146,6 +146,18 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\script
   -Stage Completion
 ```
 
+For latch-timeout dumps, add both latch hard gates:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\scripts\verify_case_deliverables.ps1 `
+  -CaseId '{case_id}' `
+  -OutDir 'C:\Users\lduan\sqlcsi-archive\reports\<case>_<brief_words>\<case>_dump_overall' `
+  -Ledger 'C:\Users\lduan\sqlcsi-archive\reports\<case>_<brief_words>\<case>_dump_overall\workflow_ledger.json' `
+  -Stage Completion `
+  -RequireSchedulerInventory `
+  -RequireLatchContendedPages
+```
+
 The deep-dive consumes, rather than regenerates, these overall artifacts:
 
 | Artifact | Use in dump-analysis |
