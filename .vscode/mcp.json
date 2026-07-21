@@ -8,25 +8,26 @@
         "MSSQL_CONNECTION_STRING": "Server=localhost;Database=xevent_analyze;User Id=sqlcsi;Password=SqlCsi#2026!;TrustServerCertificate=true"
       }
     },
+   // npm config set registry https://packagefeedproxy.microsoft.io/npm/
     "csswiki": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@azure-devops/mcp@next", "Supportability"]
+      "args": ["-y", "@azure-devops/mcp@latest", "Supportability"]
     },
     "msdata": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@azure-devops/mcp@next", "msdata"]
+      "args": ["-y", "@azure-devops/mcp@latest", "msdata"]
     },
     "sqlclientdrivers": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@azure-devops/mcp@next", "sqlclientdrivers"]
+      "args": ["-y", "@azure-devops/mcp@latest", "sqlclientdrivers"]
     },
     "microsoft": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@azure-devops/mcp@next", "microsoft", "-d", "core", "search", "repositories"],
+      "args": ["-y", "@azure-devops/mcp@latest", "microsoft", "-d", "core", "search", "repositories"],
       "env": {
         "ado_mcp_project": "OS"
       }
