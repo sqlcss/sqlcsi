@@ -1,0 +1,12 @@
+2026-06-17 15:36:48.28 Server      * BEGIN STACK DUMP:
+2026-06-17 15:36:48.28 Server      *   06/17/26 15:36:48 spid 13108
+2026-06-17 15:36:48.28 Server      * Non-yielding Scheduler
+2026-06-17 15:36:48.28 Server      Stack Signature for the dump is 0x00000000000002AD
+2026-06-17 15:36:48.28 Server      * Stack Dump being sent to C:\Log\SQLDump0020.txt
+2026-06-17 15:36:59.50 Server      Process 0:0:0 (0x3a8c) Worker 0x000003DB2803C160 appears to be non-yielding on Scheduler 42. Thread creation time: 13420087572735. Approx Thread CPU Used: kernel 890 ms, user 1750 ms. Process Utilization 39%. System Idle 56%. Interval: 70841 ms.
+2026-06-17 15:38:00.32 Server      Process 0:0:0 (0x3a8c) Worker 0x000003DB2803C160 appears to be non-yielding on Scheduler 42. Thread creation time: 13420087572735. Approx Thread CPU Used: kernel 1937 ms, user 3921 ms. Process Utilization 34%. System Idle 62%. Interval: 143054 ms.
+2026-06-17 15:39:00.96 Server      Process 0:0:0 (0x3a8c) Worker 0x000003DB2803C160 appears to be non-yielding on Scheduler 42. Thread creation time: 13420087572735. Approx Thread CPU Used: kernel 2984 ms, user 5343 ms. Process Utilization 30%. System Idle 66%. Interval: 203682 ms.
+2026-06-17 15:42:00.00 Server      Process 0:0:0 (0x4abc) Worker 0x0000000012345000 appears to be non-yielding on Scheduler 17. Thread creation time: 13420087570000. Approx Thread CPU Used: kernel 50000 ms, user 120000 ms. Process Utilization 92%. System Idle 3%. Interval: 180000 ms.
+2026-06-17 15:43:00.00 Server      Process 0:0:0 (0x4abc) Worker 0x0000000012345000 appears to be non-yielding on Scheduler 17. Thread creation time: 13420087570000. Approx Thread CPU Used: kernel 70000 ms, user 160000 ms. Process Utilization 95%. System Idle 2%. Interval: 240000 ms.
+2026-06-17 16:00:00.00 Server      * Non-yielding IOCP
+2026-06-17 17:00:00.00 Server      Error: 17888, Severity: 20, State: 1.

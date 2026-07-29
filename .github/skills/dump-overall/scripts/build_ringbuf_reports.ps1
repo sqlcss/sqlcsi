@@ -108,7 +108,7 @@ function Build-Histogram([array]$rows, [string]$catCol) {
     if (-not $catCol -or $rows.Count -eq 0) { return @() }
     $h = @{}
     foreach ($r in $rows) { $v = [string]$r[$catCol]; if ($v) { if ($h.ContainsKey($v)) { $h[$v]++ } else { $h[$v]=1 } } }
-    return @($h.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { @{ k=$_.Key; n=$_.Value } })
+    return @($h.GetEnumerator() | Sort-Object @{Expression='Value';Descending=$true}, @{Expression='Key';Ascending=$true} | ForEach-Object { @{ k=$_.Key; n=$_.Value } })
 }
 
 # ---- numeric parse: "13706324(0xd12454)" / "14(0xe)" -> int64 ----------------
@@ -153,7 +153,7 @@ function Get-Anomalies([string]$expr, [array]$cols, [array]$rows) {
             $label = 'm_severity ≥ 19（高危）或主导洪泛错误码 top-1 的最新样本（≤15）'
             $h = @{}
             foreach ($r in $rows) { $e=[string]$r['m_error']; if ($e) { if ($h.ContainsKey($e)) { $h[$e]++ } else { $h[$e]=1 } } }
-            $top = ($h.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+            $top = ($h.GetEnumerator() | Sort-Object @{Expression='Value';Descending=$true}, @{Expression='Key';Ascending=$true} | Select-Object -First 1).Key
             $sampled = 0
             foreach ($r in $rows) {
                 $sev = NumOf $r['m_severity']
@@ -176,7 +176,7 @@ function Get-Anomalies([string]$expr, [array]$cols, [array]$rows) {
             $label = '少数派 m_signal_type（≠ 主导信号类型）'
             $h = @{}
             foreach ($r in $rows) { $v=[string]$r['m_signal_type']; if ($v) { if ($h.ContainsKey($v)) { $h[$v]++ } else { $h[$v]=1 } } }
-            $dom = ($h.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+            $dom = ($h.GetEnumerator() | Sort-Object @{Expression='Value';Descending=$true}, @{Expression='Key';Ascending=$true} | Select-Object -First 1).Key
             foreach ($r in $rows) { if (([string]$r['m_signal_type']) -ne $dom) { [void]$flag.Add($r) } }
         }
         default { $label = '' }
@@ -385,6 +385,18 @@ $insertAt = $secList.Count
 for ($i=0; $i -lt $secList.Count; $i++) { if ($secList[$i].h2 -like 'DoD*') { $insertAt=$i; break } }
 $secList.Insert($insertAt, $newSec)
 $mo.sections = @($secList)
+
+# If the base manifest carries a DoD table, close the ring-surface row now that
+# all nine raw captures and subreports have been generated.
+foreach ($section in @($mo.sections | Where-Object { $_.h2 -like 'DoD*' })) {
+    foreach ($block in @($section.blocks | Where-Object { $_.type -eq 'table' })) {
+        foreach ($row in @($block.rows)) {
+            if (@($row).Count -ge 2 -and [string]$row[0] -match 'Nine ring surfaces|9.*环形缓冲') {
+                $row[1] = 'done'
+            }
+        }
+    }
+}
 
 $cardList = [System.Collections.ArrayList]@($mo.cards)
 $hasCard = $false; foreach ($c in $cardList) { if ($c.k -eq '环形缓冲命令') { $hasCard=$true; $c.v='9 条 · 见附加步骤' } }

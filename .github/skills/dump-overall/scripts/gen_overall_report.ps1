@@ -155,7 +155,7 @@ h3{color:var(--teal);font-size:14px;margin:18px 0 8px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 14px;min-width:150px}
 .card .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
 .card .v{color:var(--text);font-size:14px;margin-top:3px;font-weight:600}
-table{border-collapse:collapse;width:100%;margin:10px 0 6px;font-size:12.5px}
+table{border-collapse:collapse;width:100%;max-width:100%;margin:10px 0 6px;font-size:12.5px;display:block;overflow-x:auto}
 th,td{border:1px solid var(--border);padding:6px 9px;text-align:left;vertical-align:top}
 th{background:#2b2b40;color:var(--accent);font-weight:600}
 tr:nth-child(even) td{background:#22223200}

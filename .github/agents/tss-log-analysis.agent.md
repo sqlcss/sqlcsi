@@ -7,7 +7,7 @@ description: >-
   "调查 case", "分析 log", or provides a case directory with ERRORLOG/XEL files.
   Do NOT use for AG failover — that routes to ag-failover-analysis.
 tools: [execute, read, edit, search, agent, todo, web, msdata/*, microsoft-learn/*, csswiki/*, bluebird-mcp-sql/*, bluebird-mcp-2022/*, bluebird-mcp-2025/*, bluebird-mcp-2019/*, bluebird-mcp-2017/*, bluebird-mcp-2016/*, icm-prod/*, enghub/*, azure-mcp/*]
-agents: [errorlog-analysis, import-xevent, analyze-xevent, docs-lookup, source-search, dump-analysis, latch-timeout-analysis]
+agents: [errorlog-analysis, import-xevent, analyze-xevent, docs-lookup, source-search, dump-analysis, latch-timeout-analysis, non-yielding-analysis]
 ---
 
 # TSS Log Analysis Agent
@@ -27,6 +27,7 @@ pipeline for non-AG-failover cases.
 | `source-search` | Engine source code search |
 | `dump-analysis` | WinDbg / Mirrors commands |
 | `latch-timeout-analysis` | Latch timeout deep-dive |
+| `non-yielding-analysis` | ERRORLOG + XEvent non-yielding scheduler/IOCP/resource-monitor/stalled-dispatcher deep-dive |
 
 ## Step 0 — Gather Inputs
 
@@ -153,6 +154,18 @@ SQLDump0005     Non-yielding         2026-04-30 06:15:33  ❌ Not in case_dir
 
 ### 1c. Ask Next Steps
 
+Before offering generic choices, detect specialized non-yield evidence. If ERRORLOG contains
+`Non-yielding Scheduler`, `Non-yielding IOCP`, `Non-yielding Resource Monitor`, `Stalled
+Dispatcher`, `appears to be non-yielding`, or Errors 17883/17884/17887/17888, offer
+`non-yielding-analysis` as the recommended route. Pass through `case_id`, `case_dir`, computed
+local/UTC windows, timezone evidence, XEvent import status, dump inventory, and report
+language/format. That agent owns the ERRORLOG/XEL synthesis and delegates any matching `.mdmp`
+to `dump-analysis`.
+
+When its Log Gate receipt becomes PASS, present/open the non-yield log-analysis report
+immediately. Treat dump detection and dump-analysis as a later continuation; never delay or
+invalidate the log report while waiting for Gate A/B/C.
+
 Present the findings from 1a + 1b, then ask the user what to do next. The options
 depend on whether dumps were found:
 
@@ -181,7 +194,7 @@ Options:
 
 | User choice | Action |
 |------------|--------|
-| "分析 Dump" | Check DumpViewer installed (`Test-Path "C:\Users\lduan\tools\DumpViewer\DumpViewer.exe"`). If latch timeout dump → route to `latch-timeout-analysis` (computes latch ±2h window, calls DumpViewer + import-xevent + analyze-xevent). If non-yielding dump → route to `dump-analysis`. If not installed → inform user and fall back to "分析 Log". |
+| "分析 Dump" | If latch timeout dump → route to `latch-timeout-analysis`. If non-yielding scheduler/IOCP/resource-monitor/stalled-dispatcher dump → route to `non-yielding-analysis`, which owns ERRORLOG/XEL correlation and delegates `.mdmp` to `dump-analysis`. Other dumps route to `dump-analysis`. Each downstream dump workflow validates its own required tools; do not block non-yield ERRORLOG/XEL analysis on a DumpViewer pre-check. |
 | "先分析 Log" / "分析 Log" | **First check background XEL import status** (see below). Once import is ready → `analyze-xevent` with the same window. Present XEvent analysis results, then ask again for next step. |
 | "分析其他 Error" | Ask which error number to investigate. Route to `docs-lookup` for KB/CU research, or `source-search` for engine code lookup. |
 

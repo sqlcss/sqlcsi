@@ -43,7 +43,7 @@ Two analysis paths are available. Choose based on environment:
 scripts/import_xel_to_sql.sql
 ```
 
-The script creates database `[xevent_analyze]` with schema `[xe]` and these physical tables:
+The script creates database `[xevent_<case_id>]` with schema `[xe]` and these physical tables:
 
 | Table | Contents | Key columns |
 |-------|----------|-------------|
@@ -56,18 +56,13 @@ The script creates database `[xevent_analyze]` with schema `[xe]` and these phys
 | `xe.connectivity` | Shredded `connectivity_ring_buffer_recorded` | `conn_type`, `total_login_time_ms`, `sspi_processing_ms`, `ssl_processing_ms`, + 15 sub-timer fields |
 | `xe.login_timers` | Shredded `process_login_finish` (custom session) | `is_success`, `total_login_time_ms`, `sspi_*`, `ssl_*`, `fedauth_*`, `application_name` |
 
-**Usage:**
+**Usage (all variables are required):**
 ```bash
-# Edit @xel_path, @days, @case_id at top of script, then:
-sqlcmd -S localhost -E -i scripts/import_xel_to_sql.sql
+sqlcmd -S localhost -E -v case_id="{case_id}" xel_path="{xel_glob}" days="30" -i scripts/import_xel_to_sql.sql
 ```
 
-Configuration variables (lines 27-29 of script):
-```sql
-DECLARE @xel_path NVARCHAR(500) = N'C:\Temp\system_health_0_*.xel';
-DECLARE @days INT = 7;      -- 0 = all data
-DECLARE @case_id NVARCHAR(50) = N'{case_id}';
-```
+Never add script-level `:setvar` defaults: they override caller `-v` values and can
+silently target the wrong case database.
 
 The script is **idempotent** — re-running with the same `case_id` deletes old rows first.
 Multiple cases can coexist in the same database (filtered by `case_id`).
@@ -275,7 +270,7 @@ See full reference: [.github/references/wait-types.md](../../references/wait-typ
 
 ## Analysis Methodology (Path A)
 
-After importing data to `[xevent_analyze].[xe].*`, follow this structured analysis path.
+After importing data to `[xevent_<case_id>].[xe].*`, follow this structured analysis path.
 
 ### Phase 1: Overview — What event types exist and how many?
 
@@ -693,7 +688,7 @@ If found, inform the user and include in analysis.
 
 When called from the `sql-csi` full-analysis pipeline, return:
 
-1. **Absolute paths** of output files (JSON findings, or note that data is in `[xevent_analyze]` database)
+1. **Absolute paths** of output files (JSON findings, or note that data is in `[xevent_<case_id>]` database)
 2. **Top errors** with cross-correlation flags
 3. **Top waits** by total duration with red-flag annotations
 4. **sp_server_diagnostics** WARNING/ERROR summary

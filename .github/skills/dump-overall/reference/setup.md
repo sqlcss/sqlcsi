@@ -195,19 +195,14 @@ $mexOk = $mexPath -and (Test-Path (Join-Path $mexPath 'mex.dll'))
 If you only check Kits paths you will wrongly conclude "cdb not found" and fall back to the GUI
 path — do NOT do that.
 
-```powershell
-$cdbCandidates = @(
-    (Get-Command cdb.exe -ErrorAction SilentlyContinue).Source,
-    "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe",
-    "${env:ProgramFiles}\Windows Kits\10\Debuggers\x64\cdb.exe"
-)
-# WinDbg Store/MSIX package (most common on dev boxes) — dynamic version, resolve at runtime
-$wdbg = (Get-AppxPackage *WinDbg* | Select-Object -First 1).InstallLocation
-if ($wdbg) { $cdbCandidates += (Join-Path $wdbg 'amd64\cdb.exe') }
+Use the committed shared resolver. It checks an explicit path first, then AppX package
+registration (Slow → standard → Fast → Preview), Windows SDK paths, and finally PATH. It
+intentionally does not recursively enumerate `WindowsApps`, whose ACLs cause false negatives.
 
-$cdbPaths = $cdbCandidates | Where-Object { $_ -and (Test-Path $_) }
-if ($cdbPaths) { $cdb = $cdbPaths[0]; "Found: $cdb" }
-else { "cdb.exe not found — fall back to Path B (WinDbg GUI)" }
+```powershell
+. .github\skills\dump-overall\scripts\resolve_cdb.ps1
+$cdb = Resolve-CdbPath -Required
+"Found: $cdb"
 ```
 
 ### 1.2 DScript COM registration (do this BEFORE any `!dscript.run`)

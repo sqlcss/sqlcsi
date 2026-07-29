@@ -5,14 +5,14 @@ description: >-
   sp_server_diagnostics alerts, memory state, and AG events. Cross-correlate with
   ERRORLOG findings. Use when the user says "analyze xevent", "分析 XEvent",
   "what do the waits show", or when the orchestrator requests XEvent analysis after
-  import. Works with data in [xevent_analyze].[xe].* tables (Path A) or via
+  import. Works with data in [xevent_<case_id>].[xe].* tables (Path A) or via
   PowerShell+Node.js extraction (Path B fallback).
 tools: [execute, read, edit, search]
 ---
 
 # Analyze XEvent Agent
 
-Analyzes XEvent data that has been imported into `[xevent_analyze].[xe].*` tables
+Analyzes XEvent data that has been imported into `[xevent_<case_id>].[xe].*` tables
 (by `import-xevent` agent) or extracted to JSON (Path B fallback).
 
 ## Default Behavior

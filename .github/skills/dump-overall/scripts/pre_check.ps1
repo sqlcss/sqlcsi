@@ -33,11 +33,13 @@ param(
     [Parameter(Mandatory)][string]$DscriptPath,
     [string]$DumpViewer = '',
     [string]$MexPath    = '',
-    [string]$Wdbgcs     = ''
+    [string]$Wdbgcs     = '',
+    [string]$Cdb        = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $fail = $false
+. (Join-Path $PSScriptRoot 'resolve_cdb.ps1')
 
 function Report([string]$label, [bool]$ok, [string]$detail, [string]$tier = 'REQUIRED') {
     if ($ok) {
@@ -56,6 +58,9 @@ Report 'dump'        (Test-Path -LiteralPath $DumpPath -PathType Leaf) $DumpPath
 
 $taskJs = Join-Path $DscriptPath 'task.js'
 Report 'DScript .js' (Test-Path -LiteralPath $taskJs -PathType Leaf) $taskJs 'REQUIRED'
+
+$resolvedCdb = Resolve-CdbPath -Cdb $Cdb
+Report 'cdb.exe' ([bool]$resolvedCdb) $(if ($resolvedCdb) { $resolvedCdb } else { '(AppX / SDK / PATH)' }) 'REQUIRED'
 
 # --- PRIMARY (DumpViewer-first) ---------------------------------------------
 if ($DumpViewer) {

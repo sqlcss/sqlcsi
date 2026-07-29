@@ -162,7 +162,8 @@ decodes the running T-SQL, producing a multi-section snapshot **（纯列举，�
 | 11 | **第六步 · latch 争用页面 + 线程栈联表 (`dump_latch_contended_pages.js`)** | Run `run_dscript_once.ps1 -ScriptPath {dscript_path}\dump_latch_contended_pages.js -EndMarker 'END LATCH CONTENDED PAGES'`; then join returned thread IDs back to 第一步 stacks. If it prints `No pages found`, keep that raw evidence and still generate the latch subreport. | — automated (reuse P3 session), **no pause** |
 | 12 | **附加步骤 · SOS 环形缓冲** | **PRIMARY:** 5 rings from DumpViewer (`SchedRing`/`MonitorRing`/`OOMRing`/`MemBrokerRing`/`SchedMonitors`) + the **4 missing** via `!execute` (HADR AR ×2 / BlockedProcessReport / MemoryBrokerClerk / ProcessSummary). **FALLBACK:** all 9 via `build_ringbuf_reports.ps1`. | — **reuse** step-5's choice (FALLBACK) or run the 4 supplement `!execute` (PRIMARY), **NO new pause** |
 | 13 | **DoD Gate** | Paste + tick the DEFINITION-OF-DONE checklist | — mandatory self-check, **not a pause** |
-| 13 | **Report Generation** | Assemble the fixed artifact set («Fixed artifact set & structure») | ⏸️ **P4** — ASK **language (English / 中文)** + **format (HTML / Markdown)**, THEN write the report. |
+| 14 | **Report Generation + Completion Gate** | Assemble the fixed artifact set, then run the single canonical entry point `finalize_dump_overall.ps1`. It generates/regenerates MAIN + 9 ring subreports, runs the ledger-gated generator, executes `verify_case_deliverables.ps1 -Stage Completion`, and atomically publishes a SHA-256-bound `overall_completion_receipt.json` only after PASS. | ⏸️ **P4** — ASK **language (English / 中文)** + **format (HTML / Markdown)**, THEN write and validate the report. |
+| 15 | **POST-OVERALL first-pass probes + branch-hints report** | **Only after row 14 PASS.** Run the single canonical entry point `run_post_overall_branch_hints.ps1`. It verifies the Gate A receipt/hash, runs `run_first_pass_probes.ps1`, generates the separate report, validates Gate B, and proves the Gate A report hash is unchanged. | — automated, **no pause**; failures are isolated to Gate B evidence and MUST NOT invalidate or rewrite the completed overall gate |
 
 > **Latch dump hard gate:** for latch-timeout or latch/page-contention dumps, the DoD verifier
 > must include `-RequireSchedulerInventory -RequireLatchContendedPages`. DumpViewer latch pages
@@ -175,7 +176,8 @@ The table above is the workflow contract; the concrete script chain below is the
 validated on SQL2016 latch-timeout and SQL2019 CU20 Stalled Dispatcher dumps. Do not replace
 these steps with ad-hoc parsing or one-off HTML generation.
 
-1. **Pre-flight / setup** — run `pre_check.ps1`; run `register_dscript.ps1`; resolve `cdb.exe`,
+1. **Pre-flight / setup** — initialize `workflow_ledger.json` first with
+  `initialize_overall_workflow_ledger.ps1`; run `pre_check.ps1`; run `register_dscript.ps1`; resolve `cdb.exe`,
   `mex.dll`, `WinDbgCsExt.dll`, `{dscript_path}`, `{sym_path}`, and the archive output folder
   under `C:\Users\lduan\sqlcsi-archive\reports\<case>_<brief_words>\`.
 2. **DumpViewer primary** — run `run_dumpviewer.ps1`. Exit `0` means consume DumpViewer
@@ -219,10 +221,143 @@ these steps with ad-hoc parsing or one-off HTML generation.
   and runs the verifier. The MAIN report must show each expression as a categorized section with
   `top 20` + rule-based anomaly rows; `direct_mirror.html` / raw txt is evidence only, not the
   user-facing result.
-8. **Final assembly / gate** — run `gen_overall_report.ps1 -Ledger ...`, then
-  `verify_case_deliverables.ps1 -Stage Completion` with the required checks for thread
-  categories, SQL exec, scheduler inventory, and the fixed report set. PASS is the completion
-  definition; report existence alone is not.
+8. **Final assembly / Gate A** — run `finalize_dump_overall.ps1` with the manifest, ledger,
+  ring `txt_detail` folder, and applicable requirement switches. This is the only canonical
+  finalization entry point. It must produce MAIN + subreports, pass Completion, and atomically
+  publish `overall_completion_receipt.json`; report existence alone is not completion.
+9. **Post-overall branch hints / Gate B (separate, best effort)** — only after step 8 PASS,
+  run `run_post_overall_branch_hints.ps1`. It verifies the receipt-bound overall SHA-256 before
+  probes and again after report generation. The branch report and probe status are not members
+  of the overall completion ledger. A failed/unavailable probe is retained separately and never
+  deletes, regenerates, or downgrades `<case>_overall_report.html`.
+
+### Reproducible final command chain（validated on case 2606220030003771）
+
+After Steps 0–12 have produced their fixed artifacts, the following is the required chain for
+the same FALLBACK/English report layout. Do not hand-write the ledger, MAIN HTML, receipts, or
+branch report:
+
+```powershell
+# Run start (before Step 0)
+pwsh -File .github\skills\dump-overall\scripts\initialize_overall_workflow_ledger.ps1 `
+  -CaseId '{case_id}' -OutDir '{case_dump_overall}'
+
+# After each acquisition phase (example; repeat for each requiredSteps item)
+pwsh -File .github\skills\dump-overall\scripts\set_overall_workflow_status.ps1 `
+  -Ledger '{case_dump_overall}\workflow_ledger.json' `
+  -Group requiredSteps -Name step1_os_threads -Status done
+
+# Build the dump-specific manifest from the fixed FALLBACK artifacts
+pwsh -File .github\skills\dump-overall\scripts\build_overall_manifest_from_artifacts.ps1 `
+  -CaseId '{case_id}' -Dir '{case_dump_overall}' `
+  -DumpName '{dump_name}' -SqlVersion '{sql_version}' `
+  -Mode 'FALLBACK' -CaptureTime '{capture_time}'
+
+# Gate A: MAIN + all fixed subreports + Completion PASS + SHA-256 receipt
+pwsh -File .github\skills\dump-overall\scripts\finalize_dump_overall.ps1 `
+  -CaseId '{case_id}' -OutDir '{case_dump_overall}' `
+  -RequireThreadCategories -RequireSqlExec -RequireSchedulerInventory
+
+# Gate B: only after Gate A receipt; isolated probes + branch report + hash check
+pwsh -File .github\skills\dump-overall\scripts\run_post_overall_branch_hints.ps1 `
+  -CaseId '{case_id}' -OutDir '{case_dump_overall}' -Dump '{dump_path}'
+```
+
+For latch/page-contention cases, add `-RequireLatchContendedPages` to Gate A. With unchanged
+evidence, repeated Gate A runs must produce the same MAIN SHA-256, and repeated Gate B runs
+must produce the same branch-report SHA-256 while recording identical Gate A before/after hashes.
+
+### POST-OVERALL first-pass mirror probes & branch hints（独立报告，纯信号归桶）
+
+⛔ **Ordering hard gate:** do not run this section until the previously defined dump-overall
+MAIN report and all fixed subreports have been generated and
+`verify_case_deliverables.ps1 -Stage Completion` has printed PASS. Persist that PASS as
+`overall_completion_receipt.json`. This post-overall phase is isolated: probe failures must not
+change the overall ledger, rewrite the overall report, or turn the completed overall PASS into
+a failure.
+
+After that gate, preserve the following general first-pass probes as raw evidence. These probes
+are **coverage**, not root-cause analysis. They help the next `dump-analysis` step choose a route
+without re-opening broad discovery.
+
+```windbg
+!execute Times.Enumerate
+!execute TraceFlags.Enumerate
+!execute Sessions.Enumerate
+!execute Tasks.Enumerate
+!execute Workers.Enumerate
+!execute Schedulers.Enumerate
+!execute MemoryNodes.Enumerate
+!execute SOSNodes.Enumerate
+!execute SOSRingBuffers.EnumerateExceptionRingRecords
+!execute ExceptionContext.CurrentStack
+!execute ExceptionContext.Enumerate
+!execute ExceptionHandlerStacks.Enumerate
+```
+
+Optional probes should be captured when the script is available and the current dump type can
+support them. If a probe returns no rows or is unavailable in a minidump, keep that raw result
+as evidence instead of substituting another conclusion:
+
+```windbg
+!execute MemoryClerks.Enumerate
+!execute MemoryObjects.Enumerate
+!execute LeakedAllocations.Enumerate
+!execute DbccInputBuffers.Enumerate
+!execute QueryPlans.Enumerate
+!execute QueryExecutionTrees.Enumerate
+```
+
+The separate branch report MUST expose **two independent axes**; never collapse them into one
+green `signal-present` badge:
+
+1. **Data coverage** — `data-present`, `empty-result`, or `unavailable-with-evidence`.
+  This says only whether rows/artifacts were captured. A full Tasks, exception-ring,
+  MemoryBroker, or HADR history is ordinary inventory and is not an abnormality by itself.
+2. **Routing relevance** — `route-signal`, `context-only`, `no-route-signal`, or
+  `unavailable-with-evidence`. A route signal requires a branch-specific predicate (for
+  example `SMR_NONYIELD*`, OOM marker, abnormal current HADR role/exception, or a
+  Spinlock/Backoff stack). It selects a downstream review path; it still does not prove cause.
+
+Every bucket must include a plain-language `routingReason`. The report must not use root-cause
+or probability language.
+
+| Branch bucket | First-pass evidence sources | Downstream route |
+|---|---|---|
+| Exception / AV / dump reason | `ExceptionContext.CurrentStack`, `ExceptionContext.Enumerate`, `ExceptionHandlerStacks.Enumerate`, exception ring records, current `.ecxr` stack when captured | `dump-analysis` exception / call-stack route |
+| Scheduler / non-yield | `Schedulers.Enumerate`, `Workers.Enumerate`, SchedulerMonitor / Scheduler ring records, copied-stack records if available | scheduler / non-yield route |
+| Memory / OOM / leak | `MemoryNodes.Enumerate`, `MemoryClerks.Enumerate`, `MemoryObjects.Enumerate`, `LeakedAllocations.Enumerate`, OOM / MemoryBroker ring records | memory / OOM / leak route |
+| Query execution | active sessions/tasks, `DbccInputBuffers.Enumerate`, `QueryPlans.Enumerate`, `QueryExecutionTrees.Enumerate`, `task.js`, `tsqlstack.js`, `process_commands` stacks | query execution route |
+| Blocking / latch / locking | `Tasks.Enumerate`, `Workers.Enumerate`, `WaitingTask`/blocked-process rings when available, latch-contended-pages output, lock/latch stack groups | locking / latch route |
+| HADR / AG | HADR ring buffers, HADR-related stacks or sessions, AG-related errors in exception/ring output | HADR route |
+| IO / storage / transaction log | IO-related waits/stacks, `PendingIOs` when available, `WriteFileGather`, `WRITELOG`, log-manager frames, storage/IO ring output | IO / log route |
+| SQLPAL / Linux | Linux core/archive shape, SQLPAL modules, `SqlpalDebuggerTool`-generated context | SQLPAL workflow |
+
+**Canonical committed entry point (Gate B):**
+
+```powershell
+pwsh -File .github\skills\dump-overall\scripts\run_post_overall_branch_hints.ps1 `
+  -Dump '{dump_path}' -OutDir '{case_dump_overall}' -CaseId '{case_id}'
+```
+
+The orchestrator calls `run_first_pass_probes.ps1` →
+`gen_first_pass_branch_hints_report.ps1` → `verify_first_pass_branch_hints.ps1` internally.
+Do not bypass it in normal runs.
+
+The second command always creates a **separate** branch report and JSON sidecar:
+
+- `<case>_first_pass_branch_hints.html`
+- `<case>_first_pass_branch_hints.json`
+- `<case>_first_pass_probe_status.json`
+- `<case>_first_pass_probes.txt` + `first_pass_probe_sections\*.txt`
+- `first_pass_branch_completion_receipt.json`（Gate B PASS + Gate A hash unchanged）
+
+These files are post-overall routing artifacts, not required members of the fixed dump-overall
+artifact set or its completion ledger.
+
+> ⛔ Boundary: branch hints are only an index over first-pass evidence. They do not say the
+> problem “is” memory, HADR, scheduler, etc.; they say which evidence bucket exists and which
+> downstream deep-dive should consume it. `dump-overall` still produces facts only.
 
 > ⛔ **Gate discipline (验证过的行为):** In **PRIMARY mode** P2 does not fire — the task list
 > comes from DumpViewer. In **FALLBACK mode** P2 is the only gate where you emit a paste-ready
@@ -1481,6 +1616,21 @@ The ledger has two top-level groups:
 }
 ```
 
+Never hand-author this ledger on a normal run. Initialize it before Step 0 and atomically
+transition each item after its artifacts are present:
+
+```powershell
+pwsh -File .github\skills\dump-overall\scripts\initialize_overall_workflow_ledger.ps1 `
+  -CaseId '{case_id}' -OutDir '{case_dump_overall}'
+
+pwsh -File .github\skills\dump-overall\scripts\set_overall_workflow_status.ps1 `
+  -Ledger '{case_dump_overall}\workflow_ledger.json' `
+  -Group requiredSteps -Name step1_os_threads -Status done
+```
+
+Use `unavailable-with-evidence` only with `-Evidence <non-empty raw log paths>`. Deliverable
+items remain `missing` until their files are generated; transition them to `done` before Gate A.
+
 Allowed terminal statuses are only `done`, `unavailable-with-evidence`, and
 `skipped-by-user`. `missing`, `not_run`, `blocked`, or `failed` blocks final completion.
 `unavailable-with-evidence` is valid only when the ledger item also lists non-empty raw
@@ -1495,6 +1645,21 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .github\skills\dump-overall\script
   -Out      'reports/{case_id}_dump_overall/{case_id}_overall_report.html' `
   -Ledger   'reports/{case_id}_dump_overall/workflow_ledger.json'
 ```
+
+For normal runs, do not invoke the generator and verifier piecemeal. After the manifest,
+ledger, and nine split ring captures exist, use the canonical Gate A finalizer:
+
+```powershell
+pwsh -File .github\skills\dump-overall\scripts\finalize_dump_overall.ps1 `
+  -CaseId '{case_id}' -OutDir '{case_dump_overall}' `
+  -Manifest '{case_dump_overall}\{case_id}_overall_manifest.json' `
+  -Ledger '{case_dump_overall}\workflow_ledger.json' `
+  -RequireThreadCategories -RequireSqlExec -RequireSchedulerInventory
+```
+
+Add `-RequireLatchContendedPages` for latch/page-contention cases. The finalizer publishes
+`overall_completion_receipt.json` only after Completion PASS; the receipt binds the overall,
+manifest, and ledger by SHA-256.
 
 Before final response / `task_complete`, run the completion verifier. If it fails, the run is
 incomplete and the final response must list the missing deliverables instead of claiming
@@ -1533,6 +1698,7 @@ the **Catppuccin Mocha** dark theme. The MAIN report links to every sub-report.
 | `<case>_sql_exec_thread.html` | 第三步 detail | **per exec main**（all N, not a sample）the full call stack + decoded `Input string:` T-SQL from `tsqlstack.js`; missing tail = `[PARTIAL]` / read-fault note. |
 | `<case>_exception.html` | 异常 detail | enumeration of the exception record / faulting thread（raw facts only — no cause）. Built by `scripts\gen_exception_html.ps1` from a manifest JSON — see snippet below. |
 | `<case>_sub_<expr>.html` ×9 | 附加步骤 detail | one paginated sub-report per ring-buffer expression（total records / columns / RecordType cards → 类别直方图 → 陈旧标注 → ② 值得注意的记录 → 全量分页明细 pageSize=100）. Built by `scripts\build_ringbuf_reports.ps1` from `txt_detail\{case}_{expr}.txt`. Row count == `!execute <expr>` 输出行数. The same script injects the **附加步骤** section (top-N + 异常 per expression) into the MAIN report. |
+| `overall_completion_receipt.json` | **Gate A receipt** | Published atomically by `finalize_dump_overall.ps1` only after Completion PASS. Records overall/manifest/ledger SHA-256 and is the mandatory prerequisite for post-overall probes. |
 
 **`{case}_exception.html`** — emit it with the committed generator (never hand-roll HTML). The
 manifest lists the exception record cards, faulting-thread meta, the raw `.exr` / `!analyze -v`

@@ -50,6 +50,13 @@ $stackByTid = @{}
 foreach ($t in $threads) { $stackByTid[[int]$t.id] = (Text $t.stack) }
 $tsqlByTid = @{}
 foreach ($t in @($tsql.threads)) { $tsqlByTid[[int]$t.tid] = $t }
+$timeoutTids = @{}
+$tsqlSummaryPath = Join-Path $Dir "${CaseId}_tsqlstack.summary.json"
+if (Test-Path -LiteralPath $tsqlSummaryPath) {
+    foreach ($entry in @(Get-Content -LiteralPath $tsqlSummaryPath -Raw -Encoding UTF8 | ConvertFrom-Json)) {
+        if ([string]$entry.status -match 'timeout') { $timeoutTids[[int]$entry.tid] = $entry }
+    }
+}
 
 $mainRows = @($tasks | ForEach-Object { $_.main })
 $mainTids = @($mainRows | ForEach-Object { [int]$_.tid })
@@ -70,23 +77,22 @@ $mainThreads = @()
 foreach ($m in ($mainRows | Sort-Object tid)) {
     $tid = [int]$m.tid
     $t = $tsqlByTid[$tid]
+    $isTimeout = $timeoutTids.ContainsKey($tid) -or ($t -and $t.timeout)
     $raw = if ($t) { Text $t.rawBefore } else { 'tsqlstack block missing' }
     if ($t -and $t.comError) {
         $raw += "`r`n`r`n-- tsqlstack partial: COM $($t.comError.code) VA=$($t.comError.virtualAddress) line=$($t.comError.sourceLine)"
     }
-    if ($t -and $t.timeout) {
-        $raw += "`r`n`r`n-- tsqlstack timeout: $($t.timeout.script) exceeded $($t.timeout.timeoutSec)s; partial output above is preserved from the filtered minidump."
+    if ($isTimeout) {
+        $timeoutSeconds = if ($t -and $t.timeout) { $t.timeout.timeoutSec } else { 300 }
+        $raw += "`r`n`r`n-- tsqlstack shard timeout: exceeded ${timeoutSeconds}s; partial output above is preserved from the filtered minidump."
     }
     if ($raw -notmatch '\S') { $raw = 'tsqlstack produced no readable header before timeout/COM abort.' }
-    $timeout = Select-String -LiteralPath (Join-Path $Dir "${CaseId}_tsqlstack.txt") -Pattern "^===TASK_$tid\s+MAIN===|DSCRIPT_SHARD_TIMEOUT" -Context 0,12 -ErrorAction SilentlyContinue |
-        Where-Object { $_.Context.PostContext -match 'DSCRIPT_SHARD_TIMEOUT' }
-    if ($timeout) { $raw += "`r`n`r`n-- DSCRIPT_SHARD_TIMEOUT recorded for this main thread." }
     $meta = "<b>SPID</b> $(HE (Text $m.spid)) · <b>Scheduler</b> $(HE (Text $m.sched)) · <b>Worker</b> $(HE (Text $m.workerState)) · <b>Wait</b> $(HE (Text $m.waitType)) · <b>Elapsed</b> $(HE (Text $m.elapsedMs)) ms · <b>Children</b> $(HE (Text ($tasks | Where-Object { $_.main.tid -eq $tid } | Select-Object -First 1 -ExpandProperty childCount)))"
     $mainThreads += [ordered]@{
         tid        = [string]$tid
         cardCls    = CardClass (Text $m.workerState) (Text $m.waitType)
         statusTag  = StatusTag (Text $m.workerState) (Text $m.waitType)
-        statusText = if ($t) { if ($t.timeout) { 'TIMEOUT' } elseif ($t.comError) { 'PARTIAL' } else { 'OK' } } else { 'MISSING' }
+        statusText = if ($t) { if ($isTimeout) { 'TIMEOUT' } elseif ($t.comError) { 'PARTIAL' } else { 'OK' } } else { 'MISSING' }
         meta       = $meta
         tsqlstack  = $raw
         stack      = if ($stackByTid.ContainsKey($tid)) { $stackByTid[$tid] } else { '' }
@@ -134,7 +140,7 @@ $manifest = [ordered]@{
         [ordered]@{ k='并行/子线程'; v=[string]$childTids.Count; cls='mauve' },
         [ordered]@{ k='tsqlstack blocks'; v=[string]@($tsql.threads).Count; cls='green' },
         [ordered]@{ k='tsqlstack partial'; v=[string]@($tsql.threads | Where-Object { $_.comError }).Count; cls='yellow' },
-        [ordered]@{ k='tsqlstack timeout'; v=[string]@($tsql.threads | Where-Object { $_.timeout }).Count; cls='orange' }
+        [ordered]@{ k='tsqlstack timeout'; v=[string]$timeoutTids.Count; cls='orange' }
     )
     legend   = '本页只列举 dump 中执行语句线程状态、T-SQL 解码原始输出和调用栈；COM partial / timeout 是 filtered minidump 或脚本读取边界的证据，不代表线程不存在。'
     sections = @(

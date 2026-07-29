@@ -11,6 +11,21 @@ from DumpViewer `SqlTelemetry/Src/Tools/DumpViewer/SQLInsight/NonYieldStallAnaly
 > Symbol path: use `_NT_SYMBOL_PATH` (this machine: `srv*C:\Symbols*https://symweb.azurefd.net`).
 > Do NOT hardcode `msdl.microsoft.com` — symweb (internal) has the SQL private PDBs.
 
+## Canonical Gate C entry point
+
+For a Gate B `Scheduler / non-yield` route, read the technical methodology below, then execute
+[run_non_yield_route.ps1](../scripts/run_non_yield_route.ps1). It implements the `pTrack`,
+current-stack, and first-detected copied-stack method without hardcoded case-specific thread or
+frame IDs and emits `<case>_non_yield_findings.json`.
+
+Workflow ownership intentionally lives elsewhere to avoid duplicated contracts:
+
+- Gate C sequencing, optional Spinlock sweep, fail-open behavior, report publication, and
+  deferred copied-stack research: [SKILL.md](../SKILL.md).
+- Executable behavior: [run_non_yield_route.ps1](../scripts/run_non_yield_route.ps1),
+  [run_spinlock_owner_sweep.ps1](../scripts/run_spinlock_owner_sweep.ps1), and the finalization
+  scripts. The scripts, not this reference, are authoritative for exact commands and artifacts.
+
 ---
 
 ## Incident types (`NonYieldIncidentType`)

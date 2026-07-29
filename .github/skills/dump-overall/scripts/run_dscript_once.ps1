@@ -11,20 +11,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'resolve_cdb.ps1')
 if (-not (Test-Path -LiteralPath $ScriptPath)) { throw "script not found: $ScriptPath" }
 if (-not (Test-Path -LiteralPath $Dump)) { throw "dump not found: $Dump" }
-if (-not $Cdb) {
-    $Cdb = (Get-Item 'C:\Program Files\WindowsApps\Microsoft.WinDbg.*_x64__8wekyb3d8bbwe\amd64\cdb.exe' -ErrorAction SilentlyContinue |
-            Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName)
-    if (-not $Cdb) {
-        $pkg = Get-AppxPackage '*WinDbg*' -ErrorAction SilentlyContinue | Sort-Object InstallLocation | Select-Object -Last 1
-        if ($pkg -and $pkg.InstallLocation) {
-            $candidate = Join-Path $pkg.InstallLocation 'amd64\cdb.exe'
-            if (Test-Path -LiteralPath $candidate) { $Cdb = $candidate }
-        }
-    }
-}
-if (-not $Cdb -or -not (Test-Path -LiteralPath $Cdb)) { throw "cdb.exe not found - pass -Cdb" }
+$Cdb = Resolve-CdbPath -Cdb $Cdb -Required
 if ($TimeoutSec -le 0) { throw "-TimeoutSec must be > 0" }
 
 $dir = Split-Path -Parent $OutWds

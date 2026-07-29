@@ -83,6 +83,27 @@ ELSE:
 
 ## Analysis Workflow (report-aligned)
 
+### Optional upstream ERRORLOG/XEvent handoff
+
+When invoked from `non-yielding-analysis` after its log report is complete, the handoff
+contains a PASS `non_yield_log_analysis_completion_receipt.json`, the immutable log report,
+and the receipt-gated dump-detection result. Validate every receipt/artifact hash and require
+dump match status `matched` **before** setup or dump-overall. Never edit/regenerate upstream
+artifacts. Link the upstream log report from the downstream dump report. Dump failure cannot
+invalidate the earlier log-analysis receipt.
+
+### Entry paths and Gate ownership
+
+- **Path 1:** called by `non-yielding-analysis` after a PASS log report and matched dump.
+  Validate the immutable upstream handoff, then create Gate A → Gate B → Gate C. Their reports
+  normally do not exist when this skill starts.
+- **Path 2:** called directly with a dump. No upstream log report/receipt is required; create
+  Gate A → Gate B → Gate C from scratch.
+
+Gate A/B/C are mandatory downstream outputs, not input prerequisites. Never reject a fresh
+invocation merely because those reports/receipts are absent. Existing Gate artifacts can be
+reused only through an explicit, dump-identity- and hash-verified reuse path.
+
 The analysis produces a report whose sections ARE the steps below, in this order.
 Do the **setup** first (Step 0 → Step 1), then walk the **analysis steps** — each one
 emits one report section. Follow this linear narrative (it is the proven structure of
@@ -93,7 +114,8 @@ the `<case>_report.html` deliverable):
 | *(header meta cards)* | Step 0–1 (setup) | dump metadata: bugcheck, build, PID, MemoryLoad, uptime, capture time |
 | **第一步：线程清单与状态统计** | → **`dump-overall`** skill | thread inventory + SQLOS worker-state (stack-inferred) + authoritative TaskState (`Tasks.Enumerate`) + per-scheduler distribution + 关键观察/下一步 |
 | **第二步：执行语句线程统计** | → **`dump-overall`** skill | main/child exec-statement threads, runtime-state (blocking-chain) table, `sql_exec_thread.html` detail page |
-| **深挖第一步：子系统聚焦 & 深挖** | **深挖第一步** (§ below) | pick the subsystem the observations point to, run its deep-dive commands |
+| **Gate B：Branch hints** | → **`dump-overall`** skill | separate coverage vs routing relevance; emit machine-readable `route-signal` buckets |
+| **Gate C：Route execution** | **深挖第一步** (§ below) | execute every Gate B `route-signal`, close its evidence checklist, and pass the route-execution gate |
 | **深挖第二步：根因** | **深挖第二步** | parse outputs, compile errors + call-stack functions + server state |
 
 > **第一步 & 第二步 have been split into the standalone `dump-overall` skill** (the
@@ -170,6 +192,186 @@ The deep-dive consumes, rather than regenerates, these overall artifacts:
 | `{case}_thread_categories.html` / `thread_categories.json` | functional thread buckets and stable `cat-<key>` anchors, including empty buckets |
 | raw failure logs (`*_direct*.txt`, `*_dscript*.txt`, `workflow_ledger.json`) | minidump / mirror / DScript limitations; preserve as evidence, do not hide |
 
+### Gate B → Gate C routing contract（机器选路与深挖执行的硬连接）
+
+The post-overall Gate B report is now the **canonical default routing input** for
+dump-analysis. Do not manually re-decide the subsystem from row counts after Gate B exists.
+Consume `<case>_first_pass_branch_hints.json` as follows:
+
+- `data-present` is coverage only; it never starts a deep-dive route by itself.
+- `context-only` feeds background evidence into selected routes but does not start a route.
+- `no-route-signal` does not start that route.
+- every `route-signal` MUST become a required Gate C route.
+- a user-explicit subsystem may be added with `-AdditionalRoute`; record its origin instead
+  of silently replacing Gate B.
+- if Gate B selects no route, initialize the synthetic `General triage` route.
+
+Keep the skill boundary: **Gate B remains objective dump-overall routing; Gate C belongs to
+dump-analysis and performs interpretation/deep dive.** Merge the routing decision, not the two
+skills or their reports.
+
+Initialize Gate C immediately after Gate B PASS:
+
+```powershell
+pwsh -File .github\skills\dump-analysis\scripts\initialize_route_execution_ledger.ps1 `
+  -CaseId '{case_id}' `
+  -BranchJson '{case_dump_overall}\{case_id}_first_pass_branch_hints.json' `
+  -OutDir '{case_analysis_dir}'
+```
+
+The initializer creates a route-specific checklist. While running each deep dive, close every
+check with real raw evidence:
+
+```powershell
+pwsh -File .github\skills\dump-analysis\scripts\set_route_execution_check.ps1 `
+  -Ledger '{case_analysis_dir}\{case_id}_route_execution_ledger.json' `
+  -Route scheduler_non_yield -Check ptrack_recovery -Status completed `
+  -Evidence '{case_id}_deepdive_extract.txt'
+```
+
+Terminal required-check statuses are only `completed` and `unavailable-with-evidence`; both require
+non-empty evidence. A route whose native/deep-dive checks complete but has one or more partial
+checks is `completed-with-limitations`; an entirely unavailable route is
+`unavailable-with-evidence`. For required checks, `pending`, `in-progress`, and `failed` block
+Gate C. Optional extension checks (`required=false`) never block the base route. When related routes
+select the same incident thread/resource (for example Scheduler/non-yield +
+Blocking/latch/locking), execute one combined debugger session but close both route checklists.
+
+For every `Scheduler / non-yield` route, run build-matched DScript
+`non_yield_analysis.js` first and retain its raw/console output. The script may emit useful core
+metrics and then fail in an extended section on a filtered minidump; record that check as
+`unavailable-with-evidence` and continue the mandatory native `pTrack` + copied-stack fallback.
+Never omit the script and never treat its partial failure as absence of a non-yield incident.
+
+Use the canonical executor; do not hand-build a case-specific callback/offender script:
+
+```powershell
+pwsh -File .github\skills\dump-analysis\scripts\run_non_yield_route.ps1 `
+  -CaseId '{case_id}' -Dump '{dump_path}' `
+  -AnalysisDir '{case_analysis_dir}' -OverallDir '{case_dump_overall}' `
+  -DscriptPath '{dscript_path}' -MexPath '{mex_path}'
+```
+
+The executor performs this fixed sequence:
+
+1. Run `non_yield_analysis.js`; parse offender, pass count, wall/kernel/user time, and retain
+  complete or partial error output.
+2. Discover the SchedulerMonitor callback thread from `us_threads_shredded.json` by stack
+  signature; never hardcode a debugger thread.
+3. Run a DX frame-discovery pass and find the callback frame containing
+  `SQL_SOSNonYieldSchedulerCallback` / `ExecuteNonYieldSchedulerCallbacks`; never hardcode a
+  frame index.
+4. Run native fallback to recover/validate `pTrack`, worker, task, OS TID, scheduler, pass and
+  timing fields; capture offender current stack and `g_copiedStackInfo.threadContext` stack.
+5. Parse the matching SchedulerMonitor NONYIELD/STUCK_DISPATCHER row and affected scheduler
+  inventory.
+6. Correlate task.js/tsqlstack to SPID and SQL text.
+7. If both current and first-detected copied stacks contain spinlock acquisition/backoff,
+  invoke the optional `run_spinlock_owner_sweep.ps1` extension. This child starts headless `cdb.exe`, loads MEX, and
+  executes `!us -l -i Spinlock` directly. It does **not** read DumpViewer ThreadDetails or a
+  prior `!mex.us` artifact and does **not** use WinDbg MCP. `-l` guarantees all debugger IDs
+  are shown even when one stack group has many waiters; `-i` supplies OS TIDs.
+8. For every matching thread and every dynamically discovered `SpinToAcquire*` frame, extract
+  the lock `this`, group multiple waiters by lock address, decode each distinct raw lock word,
+  resolve each nominal owner with cdb `~~[OS_TID]s` + `!mex.t`, capture its stack, and retain
+  `actualHolderStatus=unresolved` unless identity plus stack/object evidence validates it.
+  Emit standalone JSON/HTML, publish a concise handoff into `<case>_non_yield_findings.json`,
+  and close its two optional Scheduler checks. The original nine Scheduler checks remain the
+  mandatory route contract.
+
+The Spinlock extension is **fail-open**. `run_non_yield_route.ps1` catches a missing script,
+cdb timeout, MEX error, parser failure, or report-render failure; writes
+`<case>_spinlock_owner_sweep_failure.txt`; publishes an `unavailable-with-evidence` handoff when
+possible; and continues after the nine mandatory checks complete. Its two ledger checks use
+`required=false` and never change the base route status. `finalize_route_execution.ps1` also
+migrates old ledgers and ignores non-terminal optional checks. Therefore this extension can
+enrich, but cannot suppress or invalidate, the pre-existing Gate C and final reports.
+
+`finalize_route_execution.ps1` consumes those findings and must render them into
+`<case>_route_scheduler_non_yield.html` (incident event, identities, DScript/native timing,
+current-vs-copied stack, conditional Spinlock inventory/owner results, task/SQL correlation,
+and raw links). During final completion,
+`finalize_dump_analysis.ps1` idempotently invokes `inject_non_yield_findings.ps1` to publish the
+same structured handoff between `NON-YIELD-FINAL-START/END` markers in the final HTML, then runs
+`verify_non_yield_route.ps1`. Missing findings, missing route report fields, missing final-report
+markers, or missing raw evidence block completion.
+
+Before compiling the final root-cause report, Gate C MUST pass:
+
+```powershell
+pwsh -File .github\skills\dump-analysis\scripts\finalize_route_execution.ps1 `
+  -CaseId '{case_id}' `
+  -Ledger '{case_analysis_dir}\{case_id}_route_execution_ledger.json'
+```
+
+This emits:
+
+- `<case>_route_execution_report.html` — Gate C index/overall execution proof;
+- `<case>_route_<route-key>.html` — one independent deep-dive execution report for every
+  selected route;
+- `route_execution_completion_receipt.json` — hashes the Gate C index and every route
+  subreport.
+
+No final findings/root-cause report and no `task_complete` are allowed before this receipt is
+`PASS`.
+
+After Gate C PASS, generate the final root-cause report and link
+`<case>_route_execution_report.html` and the authoritative Gate A
+`<case>_overall_report.html`. The final report may show a concise handoff card/table, but must
+not visibly duplicate the complete overall thread/task/ring inventory.
+
+### Deferred Scheduler route continuation — run after overall + base final exist
+
+When Gate C selected `scheduler_non_yield`, do **not** run optional full callstack research inside
+`run_non_yield_route.ps1` or `finalize_route_execution.ps1`. That multi-source source/bug/PR/CU
+research is high latency. First finish Gate A, Gate B, Gate C, and generate the base final HTML so
+the user can inspect the overall and root-cause reports immediately. Then execute this deferred
+continuation:
+
+```powershell
+pwsh -File .github\skills\dump-analysis\scripts\prepare_non_yield_callstack_research.ps1 `
+  -CaseId '{case_id}' -AnalysisDir '{case_analysis_dir}' `
+  -OverallDir '{case_dump_overall}' -FinalReport '{base_final_report}' `
+  -Dump '{dump_path}' -SqlVersion '{sql_version_and_build}' `
+  -Branch '{source_branch}' -Changeset '{changeset}'
+```
+
+The request script proves by SHA-256 that the authoritative overall report, Gate C route, base
+final, and structured non-yield findings already exist. Invoke the `callstack-research` agent with
+the emitted `<case>_non_yield_callstack_research_request.json`; it must use the FIRST-DETECTED
+copied stack as primary evidence and write exactly three reports under
+`callstack_research_copied_stack/` without modifying Gate A/B/C or the base final.
+
+After the agent returns:
+
+```powershell
+pwsh -File .github\skills\dump-analysis\scripts\finalize_non_yield_callstack_research.ps1 `
+  -Request '{case_analysis_dir}\{case_id}_non_yield_callstack_research_request.json'
+```
+
+When successful, this publishes `non_yield_callstack_research_completion_receipt.json`, binding all three reports
+to the pre-research hashes. The completed overall and Gate C receipts remain valid throughout;
+the slow research is a post-final Scheduler extension, not a reason to rerun dump collection.
+
+Then run the final completion gate:
+
+```powershell
+pwsh -File .github\skills\dump-analysis\scripts\finalize_dump_analysis.ps1 `
+  -CaseId '{case_id}' -AnalysisDir '{case_analysis_dir}' `
+  -OverallDir '{case_dump_overall}' -FinalReport '{final_report}'
+```
+
+It always verifies Gate A/B/C receipts and hashes, Gate B→C route-count agreement, Gate C evidence
+hashes, every selected-route subreport/hash, the final report's Gate C link, and all
+mandatory final-report local links. For a selected Scheduler/non-yield route it attempts to
+validate the deferred callstack-research receipt and all three reports, then idempotently
+injects the English full-report and `#narration` links. This publication is **fail-open**:
+missing or invalid optional artifacts create
+`non_yield_callstack_research_optional_failure.txt` and an `unavailable-with-evidence` entry in
+the final receipt, but Gate A/B/C and the base final report still complete. It also requires the
+Gate A overall link and rejects a visible duplicate overall section. Only
+`dump_analysis_completion_receipt.json` with `status=PASS` permits final completion.
+
 For Scheduler / Stalled Dispatcher cases, the verified pattern is: start from `task_fields.json`
 to find many runnable/suspended tasks sharing one blocker reason such as `SEARCH_OR scheduler
 yield`; correlate the blocker thread/SPID/scheduler with `sys.schedulers.js` or
@@ -182,6 +384,16 @@ inventory instead.
 ---
 
 ## 深挖第一步（报告「深挖第一步」）：子系统聚焦 · Determine Analysis Focus
+
+### 2.0 Route source precedence
+
+1. Gate B `route-signal` buckets (default and mandatory).
+2. User-explicit `subsystem` additions (recorded as `user-explicit`).
+3. Error/call-stack-derived additions only when the evidence is explicit and saved.
+4. General triage fallback when no route signal exists.
+
+The table below defines how an already-selected route is executed; it no longer replaces Gate B
+as a second independent routing decision.
 
 ### 2.1 Subsystem-to-Script Mapping
 
@@ -400,6 +612,10 @@ Flag:
 ```
 
 Save to `reports/{case_id}_dump_findings.md` (workspace-relative path).
+
+The findings/root-cause report is not the completion gate. It must be followed by
+`finalize_dump_analysis.ps1`; otherwise the analysis remains incomplete even if HTML/Markdown
+exists.
 
 ---
 

@@ -29,7 +29,10 @@
 param(
     # Comma- (or semicolon-) separated list; each entry is "TID" or "TID:ROLE".
     # ROLE defaults to MAIN; children use CHILD / CHILD-A / ...  e.g. '7364:MAIN,120:CHILD-A'
-    [Parameter(Mandatory=$true)][string] $Threads,
+    [string] $Threads,
+    # File containing the same comma-/semicolon-/newline-separated thread specs.
+    # Prefer this for large sweeps so task shells cannot reinterpret commas.
+    [string] $ThreadsFile,
     [Parameter(Mandatory=$true)][string]   $DscriptPath,   # folder holding task.js
     [Parameter(Mandatory=$true)][string]   $LogFile,       # .logopen target (the task_all.txt)
     [Parameter(Mandatory=$true)][string]   $OutWds,        # path to write the generated .wds
@@ -50,8 +53,13 @@ $js = Join-Path $DscriptPath $Script
 if (!(Test-Path $js)) { throw "script not found: $js (is -DscriptPath correct?)" }
 
 # --- build the .wds (proven layout) ---
-$threadList = $Threads -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-if (-not $threadList) { throw "-Threads is empty - pass e.g. '7364:MAIN,120:CHILD-A'" }
+if ($Threads -and $ThreadsFile) { throw "pass either -Threads or -ThreadsFile, not both" }
+if ($ThreadsFile) {
+    if (-not (Test-Path -LiteralPath $ThreadsFile -PathType Leaf)) { throw "threads file not found: $ThreadsFile" }
+    $Threads = Get-Content -LiteralPath $ThreadsFile -Raw -Encoding UTF8
+}
+$threadList = $Threads -split '[,;\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+if (-not $threadList) { throw "thread list is empty - pass -Threads or -ThreadsFile" }
 
 $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine(".logopen $LogFile")
@@ -82,18 +90,8 @@ if (-not $Run) {
 # --- optional: run it headless in cdb (the proven invocation) ---
 if (!$Dump)          { throw "-Run requires -Dump" }
 if (!(Test-Path $Dump)) { throw "dump not found: $Dump" }
-if (-not $Cdb) {
-    $Cdb = (Get-Item 'C:\Program Files\WindowsApps\Microsoft.WinDbg.*_x64__8wekyb3d8bbwe\amd64\cdb.exe' -ErrorAction SilentlyContinue |
-            Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName)
-    if (-not $Cdb) {
-        $pkg = Get-AppxPackage '*WinDbg*' -ErrorAction SilentlyContinue | Sort-Object InstallLocation | Select-Object -Last 1
-        if ($pkg -and $pkg.InstallLocation) {
-            $candidate = Join-Path $pkg.InstallLocation 'amd64\cdb.exe'
-            if (Test-Path -LiteralPath $candidate) { $Cdb = $candidate }
-        }
-    }
-}
-if (-not $Cdb -or !(Test-Path $Cdb)) { throw "cdb.exe not found - pass -Cdb <path> (Store WinDbg amd64\cdb.exe)" }
+. (Join-Path $PSScriptRoot 'resolve_cdb.ps1')
+$Cdb = Resolve-CdbPath -Cdb $Cdb -Required
 
 $console = [System.IO.Path]::ChangeExtension($OutWds, 'console.txt')
 Write-Host "[gen_task_sweep] cdb  : $Cdb"

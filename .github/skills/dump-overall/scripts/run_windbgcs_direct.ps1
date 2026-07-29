@@ -52,6 +52,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'resolve_cdb.ps1')
 
 if (-not (Test-Path $Dump))    { throw "dump not found: $Dump" }
 if (-not (Test-Path $Wdbgcs))  { throw "wdbgcs folder not found: $Wdbgcs" }
@@ -62,23 +63,8 @@ if (-not $Expr -or $Expr.Count -eq 0) { throw "no expressions provided (-Expr)" 
 if (-not (Test-Path $OutDir))  { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
 
 # ---- resolve cdb.exe (same logic as run_windbgcs_tasks.ps1) ------------------
+$Cdb = Resolve-CdbPath -Cdb $Cdb
 if (-not $Cdb) {
-    $cand = @(
-        (Get-Command cdb.exe -ErrorAction SilentlyContinue).Source,
-        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe",
-        "${env:ProgramFiles}\Windows Kits\10\Debuggers\x64\cdb.exe"
-    )
-    $wdbg = (Get-AppxPackage *WinDbg* -ErrorAction SilentlyContinue | Select-Object -First 1).InstallLocation
-    if ($wdbg) { $cand += (Join-Path $wdbg 'amd64\cdb.exe') }
-    try {
-        $glob = Get-ChildItem "${env:ProgramFiles}\WindowsApps\Microsoft.WinDbg*_x64_*\amd64\cdb.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
-        if ($glob) { $cand += $glob.FullName }
-    } catch {}
-    # NOTE: force array with @(...) or PS unwraps single-element result into a
-    # string and [0] returns the first character (e.g. 'C').
-    $Cdb = @($cand | Where-Object { $_ -and (Test-Path $_) })[0]
-}
-if (-not $Cdb -or -not (Test-Path $Cdb)) {
     Write-Host "[run_windbgcs_direct] ERROR: cdb.exe not found — install Windows Kits Debuggers or WinDbg Store package (any of Microsoft.WinDbg / .Fast / .Slow / .Preview)" -ForegroundColor Red
     exit 1
 }

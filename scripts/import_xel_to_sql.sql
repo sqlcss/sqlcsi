@@ -8,10 +8,10 @@
 --   Or edit the :setvar defaults below and run directly.
 -- =============================================================================
 
--- Defaults (overridden by sqlcmd -v)
-:setvar case_id "2606010030001676"
-:setvar xel_path "C:\Temp\2606010030001676\db02log0601\db02log519\system_health_0_*.xel"
-:setvar days "30"
+-- REQUIRED sqlcmd variables: case_id, xel_path, days.
+-- Do not add :setvar defaults here: script-level :setvar overrides caller -v values
+-- and can silently import into the wrong case database. Pass all three via -v or
+-- define them in a small wrapper before :r this file.
 
 USE master;
 GO

@@ -2,7 +2,7 @@
 gen_tasks_full_html.ps1 — Task-level detail HTML from Tasks.Enumerate raw text.
 
 CANONICAL SHAPE (Catppuccin Mocha, zh):
-  1. Header + meta cards           (总任务 / SUSPENDED / RUNNABLE / RUNNING / DONE)
+    1. Header + meta cards           (总任务 / SUSPENDED / RUNNABLE / RUNNING / PENDING / DONE)
   2. 读法说明 (note)
   3. 表 2 · SQLOS 任务级状态        (3 列 + 合计 · matches overall-report format)
   4. 表 3 · 按调度器分布            (SchedulerId 透视，隐藏/系统 聚合，合计)
@@ -87,7 +87,7 @@ $nonNull = ($rows | Where-Object { $_.State -ne 'nullptr' }).Count
 if ($total -eq 0) { throw "No task rows parsed from $Src" }
 
 # ---- state summary ----------------------------------------------------------
-$stateOrder = @('SUSPENDED','RUNNABLE','RUNNING','DONE')
+$stateOrder = @('SUSPENDED','RUNNABLE','RUNNING','PENDING','DONE')
 $stateCounts = @{}
 foreach ($s in $stateOrder) { $stateCounts[$s] = 0 }
 $nullCount = 0
@@ -109,7 +109,7 @@ $totalBound = $nonNull
 # ---- scheduler pivot --------------------------------------------------------
 $HIDDEN_ID = 1048576
 $pivotMap = @{}   # sched -> hashtable(state -> count)
-$hidden = @{ Total = 0; SUSPENDED = 0; RUNNABLE = 0; RUNNING = 0; DONE = 0 }
+$hidden = @{ Total = 0; SUSPENDED = 0; RUNNABLE = 0; RUNNING = 0; PENDING = 0; DONE = 0 }
 foreach ($r in $rows) {
     if ($r.State -eq 'nullptr') { continue }
     $sn = 0
@@ -124,7 +124,7 @@ foreach ($r in $rows) {
         if ($hidden.ContainsKey($r.State)) { $hidden[$r.State]++ }
     } else {
         if (-not $pivotMap.ContainsKey($sn)) {
-            $pivotMap[$sn] = @{ Total = 0; SUSPENDED = 0; RUNNABLE = 0; RUNNING = 0; DONE = 0 }
+            $pivotMap[$sn] = @{ Total = 0; SUSPENDED = 0; RUNNABLE = 0; RUNNING = 0; PENDING = 0; DONE = 0 }
         }
         $pivotMap[$sn].Total++
         if ($pivotMap[$sn].ContainsKey($r.State)) { $pivotMap[$sn][$r.State]++ }
@@ -147,18 +147,19 @@ foreach ($s in $stateOrder) {
 # ---- table 3 HTML (scheduler pivot) -----------------------------------------
 $sb3 = New-Object System.Text.StringBuilder
 [void]$sb3.Append('<h3>表 3 · 按调度器分布（Tasks.Enumerate 按 SchedulerId 透视 · 纯计数）</h3>')
-[void]$sb3.Append('<table><thead><tr><th class="num">调度器</th><th class="num">总数</th><th class="num">SUSPENDED</th><th class="num">RUNNABLE</th><th class="num">RUNNING</th><th class="num">DONE</th></tr></thead><tbody>')
+[void]$sb3.Append('<table><thead><tr><th class="num">调度器</th><th class="num">总数</th><th class="num">SUSPENDED</th><th class="num">RUNNABLE</th><th class="num">RUNNING</th><th class="num">PENDING</th><th class="num">DONE</th></tr></thead><tbody>')
 foreach ($id in $visibleIds) {
     $v = $pivotMap[$id]
-    [void]$sb3.Append("<tr><td class=""num"">$id</td><td class=""num"">$($v.Total)</td><td class=""num"">$($v.SUSPENDED)</td><td class=""num"">$($v.RUNNABLE)</td><td class=""num"">$($v.RUNNING)</td><td class=""num"">$($v.DONE)</td></tr>")
+    [void]$sb3.Append("<tr><td class=""num"">$id</td><td class=""num"">$($v.Total)</td><td class=""num"">$($v.SUSPENDED)</td><td class=""num"">$($v.RUNNABLE)</td><td class=""num"">$($v.RUNNING)</td><td class=""num"">$($v.PENDING)</td><td class=""num"">$($v.DONE)</td></tr>")
 }
-[void]$sb3.Append("<tr><td class=""num"">隐藏/系统 (id&ge;1048576)</td><td class=""num"">$($hidden.Total)</td><td class=""num"">$($hidden.SUSPENDED)</td><td class=""num"">$($hidden.RUNNABLE)</td><td class=""num"">$($hidden.RUNNING)</td><td class=""num"">$($hidden.DONE)</td></tr>")
+[void]$sb3.Append("<tr><td class=""num"">隐藏/系统 (id&ge;1048576)</td><td class=""num"">$($hidden.Total)</td><td class=""num"">$($hidden.SUSPENDED)</td><td class=""num"">$($hidden.RUNNABLE)</td><td class=""num"">$($hidden.RUNNING)</td><td class=""num"">$($hidden.PENDING)</td><td class=""num"">$($hidden.DONE)</td></tr>")
 $sumTot = ($visibleIds | ForEach-Object { $pivotMap[$_].Total } | Measure-Object -Sum).Sum + $hidden.Total
 $sumSus = ($visibleIds | ForEach-Object { $pivotMap[$_].SUSPENDED } | Measure-Object -Sum).Sum + $hidden.SUSPENDED
 $sumRbl = ($visibleIds | ForEach-Object { $pivotMap[$_].RUNNABLE }  | Measure-Object -Sum).Sum + $hidden.RUNNABLE
 $sumRun = ($visibleIds | ForEach-Object { $pivotMap[$_].RUNNING }   | Measure-Object -Sum).Sum + $hidden.RUNNING
+$sumPen = ($visibleIds | ForEach-Object { $pivotMap[$_].PENDING }   | Measure-Object -Sum).Sum + $hidden.PENDING
 $sumDon = ($visibleIds | ForEach-Object { $pivotMap[$_].DONE }      | Measure-Object -Sum).Sum + $hidden.DONE
-[void]$sb3.Append("<tr><td><b>合计</b></td><td class=""num""><b>$sumTot</b></td><td class=""num""><b>$sumSus</b></td><td class=""num""><b>$sumRbl</b></td><td class=""num""><b>$sumRun</b></td><td class=""num""><b>$sumDon</b></td></tr>")
+[void]$sb3.Append("<tr><td><b>合计</b></td><td class=""num""><b>$sumTot</b></td><td class=""num""><b>$sumSus</b></td><td class=""num""><b>$sumRbl</b></td><td class=""num""><b>$sumRun</b></td><td class=""num""><b>$sumPen</b></td><td class=""num""><b>$sumDon</b></td></tr>")
 [void]$sb3.Append('</tbody></table>')
 
 # ---- notable rows (RUNNING + RUNNABLE) --------------------------------------
@@ -274,7 +275,8 @@ $visibleForJson = foreach ($id in $visibleIds) {
     $v = $pivotMap[$id]
     [pscustomobject]@{
         id = $id; total = $v.Total; SUSPENDED = $v.SUSPENDED
-        RUNNABLE = $v.RUNNABLE; RUNNING = $v.RUNNING; DONE = $v.DONE
+        RUNNABLE = $v.RUNNABLE; RUNNING = $v.RUNNING
+        PENDING = $v.PENDING; DONE = $v.DONE
     }
 }
 $notableForJson = foreach ($r in $notable) {
@@ -294,10 +296,12 @@ $stats = [pscustomobject]@{
         visible = @($visibleForJson)
         hidden  = [pscustomobject]@{
             total = $hidden.Total; SUSPENDED = $hidden.SUSPENDED
-            RUNNABLE = $hidden.RUNNABLE; RUNNING = $hidden.RUNNING; DONE = $hidden.DONE
+            RUNNABLE = $hidden.RUNNABLE; RUNNING = $hidden.RUNNING
+            PENDING = $hidden.PENDING; DONE = $hidden.DONE
         }
         total   = [pscustomobject]@{
-            total = $sumTot; SUSPENDED = $sumSus; RUNNABLE = $sumRbl; RUNNING = $sumRun; DONE = $sumDon
+            total = $sumTot; SUSPENDED = $sumSus; RUNNABLE = $sumRbl; RUNNING = $sumRun
+            PENDING = $sumPen; DONE = $sumDon
         }
     }
     notable         = @($notableForJson)

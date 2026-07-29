@@ -25,6 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'resolve_cdb.ps1')
 
 if (-not (Test-Path $Dump))    { throw "dump not found: $Dump" }
 if (-not (Test-Path $MexPath)) { throw "mex_path not found: $MexPath" }
@@ -32,21 +33,8 @@ if (-not (Test-Path (Join-Path $MexPath 'mex.dll'))) { throw "mex.dll missing un
 if (-not (Test-Path $OutDir))  { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
 
 # ---- resolve cdb.exe ---------------------------------------------------------
+$Cdb = Resolve-CdbPath -Cdb $Cdb
 if (-not $Cdb) {
-    $cand = @(
-        (Get-Command cdb.exe -ErrorAction SilentlyContinue).Source,
-        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe",
-        "${env:ProgramFiles}\Windows Kits\10\Debuggers\x64\cdb.exe"
-    )
-    $wdbg = (Get-AppxPackage *WinDbg* -ErrorAction SilentlyContinue | Select-Object -First 1).InstallLocation
-    if ($wdbg) { $cand += (Join-Path $wdbg 'amd64\cdb.exe') }
-    try {
-        $glob = Get-ChildItem "${env:ProgramFiles}\WindowsApps\Microsoft.WinDbg*_x64_*\amd64\cdb.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
-        if ($glob) { $cand += $glob.FullName }
-    } catch {}
-    $Cdb = @($cand | Where-Object { $_ -and (Test-Path $_) })[0]
-}
-if (-not $Cdb -or -not (Test-Path $Cdb)) {
     Write-Host "[run_mex_us] ERROR: cdb.exe not found — install Windows Kits Debuggers or WinDbg Store package" -ForegroundColor Red
     exit 1
 }

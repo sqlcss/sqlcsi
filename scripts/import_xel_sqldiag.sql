@@ -6,9 +6,8 @@
 --   sqlcmd -S localhost -E -v case_id="xxx" xel_path="C:\...\*SQLDIAG*.xel" days="3" -i scripts/import_xel_sqldiag.sql
 -- =============================================================================
 
-:setvar case_id "2604300030000700"
-:setvar xel_path "C:\Temp\2604300030000700\*SQLDIAG*.xel"
-:setvar days "3"
+-- REQUIRED sqlcmd variables: case_id, xel_path, days. Never add in-script
+-- defaults because they override caller -v values and can target the wrong case.
 
 USE [xevent_$(case_id)];
 SET NOCOUNT ON;

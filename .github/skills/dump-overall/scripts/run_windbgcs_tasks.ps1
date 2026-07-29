@@ -30,6 +30,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'resolve_cdb.ps1')
 
 if (-not (Test-Path $Dump))    { throw "dump not found: $Dump" }
 if (-not (Test-Path $Wdbgcs))  { throw "wdbgcs folder not found: $Wdbgcs" }
@@ -38,28 +39,8 @@ if (-not (Test-Path $ext))     { throw "WinDbgCsExt.dll missing under: $Wdbgcs" 
 if (-not (Test-Path $OutDir))  { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
 
 # ---- resolve cdb.exe ---------------------------------------------------------
-# Order: explicit $Cdb → PATH → Windows Kits → AppxPackage → direct WindowsApps
-# glob (matches Microsoft.WinDbg / Microsoft.WinDbg.Fast / Microsoft.WinDbg.Slow
-# / Microsoft.WinDbg.Preview — AppxPackage sometimes returns nothing under
-# constrained shells, so the glob is the reliable last resort).
+$Cdb = Resolve-CdbPath -Cdb $Cdb
 if (-not $Cdb) {
-    $cand = @(
-        (Get-Command cdb.exe -ErrorAction SilentlyContinue).Source,
-        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe",
-        "${env:ProgramFiles}\Windows Kits\10\Debuggers\x64\cdb.exe"
-    )
-    $wdbg = (Get-AppxPackage *WinDbg* -ErrorAction SilentlyContinue | Select-Object -First 1).InstallLocation
-    if ($wdbg) { $cand += (Join-Path $wdbg 'amd64\cdb.exe') }
-    # Fallback: enumerate WindowsApps directly (works even when Get-AppxPackage is empty).
-    try {
-        $glob = Get-ChildItem "${env:ProgramFiles}\WindowsApps\Microsoft.WinDbg*_x64_*\amd64\cdb.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
-        if ($glob) { $cand += $glob.FullName }
-    } catch {}
-    # NOTE: force array with @(...) or PS unwraps single-element result into a
-    # string and [0] returns the first character (e.g. 'C').
-    $Cdb = @($cand | Where-Object { $_ -and (Test-Path $_) })[0]
-}
-if (-not $Cdb -or -not (Test-Path $Cdb)) {
     Write-Host "[run_windbgcs_tasks] ERROR: cdb.exe not found — install Windows Kits Debuggers or WinDbg Store package (any of Microsoft.WinDbg / .Fast / .Slow / .Preview)" -ForegroundColor Red
     exit 1
 }
@@ -131,9 +112,13 @@ if (-not (Test-Path $cdbLog)) {
 }
 $sz     = (Get-Item $cdbLog).Length
 $hasMk  = (Select-String -Path $cdbLog -Pattern 'TaskOutput:' -SimpleMatch -Quiet)
-Write-Host ("[run_windbgcs_tasks] result: tasks_output.txt = {0} bytes; TaskOutput marker = {1}" -f $sz, $hasMk) `
-    -ForegroundColor ($(if ($hasMk) { 'Green' } else { 'Red' }))
-if ($hasMk) { exit 0 } else {
+$hasRun = (Select-String -Path $cdbLog -Pattern 'Running:Tasks' -SimpleMatch -Quiet)
+$hasHeader = (Select-String -Path $cdbLog -Pattern '^task\s+\|\s+scheduler_id\s+\|\s+worker\s+\|\s+thread\s+\|\s+task_state\s+\|' -Quiet)
+$hasRows = (Select-String -Path $cdbLog -Pattern '^0x[0-9a-fA-F`]+\s+\|\s+\d+\s+\|' -Quiet)
+$validTasks = $hasMk -or ($hasRun -and $hasHeader -and $hasRows)
+Write-Host ("[run_windbgcs_tasks] result: tasks_output.txt = {0} bytes; TaskOutput marker = {1}; valid Tasks pipe table = {2}" -f $sz, $hasMk, ($hasRun -and $hasHeader -and $hasRows)) `
+    -ForegroundColor ($(if ($validTasks) { 'Green' } else { 'Red' }))
+if ($validTasks) { exit 0 } else {
     Write-Host "[run_windbgcs_tasks] NOTE: If !dcs_initsymsvr 404'd or CodeGen failed, fall back to run_sqlscriptrepl.ps1 with a pre-seeded NetStandard20Refs\<build> bundle." -ForegroundColor Yellow
     exit 1
 }

@@ -52,8 +52,23 @@ foreach ($b in $blocks) {
     $m = Get-First $body 'BLOCKER_0[^:]*:\s*(.+?)\s*$'; if ($m) { $r.blkReason = $m[1].Trim() }
     $m = Get-First $body '---->\s*SOS_Task\s*:\s*\S+\s*\(SPID:(\d+),.*~(\d+)s'
     if ($m) { $r.blkSpid = [int]$m[1]; $r.blkTid = [int]$m[2] }
-    $rows += ,$r
+    $rows += ,([pscustomobject]$r)
 }
+
+# A sweep may append per-thread retries after the original shard output. Keep one
+# best-populated row per (TID, role), otherwise retried children inflate parent
+# child counts and the overall execution inventory.
+$rows = @($rows | Group-Object tid,kind | ForEach-Object {
+    $_.Group | Sort-Object -Descending -Property @{
+        Expression = {
+            $score = 0
+            foreach ($name in @('spid','sched','taskState','workerState','elapsedMs','cpuMs','taskFunc','waitType','blkReason')) {
+                if ($null -ne $_[$name] -and [string]$_[$name] -ne '') { $score++ }
+            }
+            $score
+        }
+    } | Select-Object -First 1
+})
 
 # group by SPID: MAIN is parent, CHILD share parent's SPID
 $mains = $rows | Where-Object { $_.kind -eq 'MAIN' }

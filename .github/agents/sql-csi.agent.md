@@ -7,7 +7,7 @@ description: >-
   for "full analysis". Do NOT trigger for general SQL query writing, T-SQL syntax,
   DBA tasks, or query tuning.
 tools: [execute, read, edit, search, agent, todo, web, wpa/*, msdata/*, microsoft-learn/*, csswiki/*, bluebird-mcp-sql/*, bluebird-mcp-2022/*, bluebird-mcp-2025/*, bluebird-mcp-2019/*, bluebird-mcp-2017/*, bluebird-mcp-2016/*, icm-prod/*, enghub/*, azure-mcp/*]
-agents: [tss-log-analysis, ag-failover-analysis, wpr-trace-analysis, errorlog-analysis, import-xevent, analyze-xevent, docs-lookup, source-search, dump-analysis, latch-timeout-analysis]
+agents: [tss-log-analysis, ag-failover-analysis, wpr-trace-analysis, errorlog-analysis, import-xevent, analyze-xevent, docs-lookup, source-search, dump-analysis, latch-timeout-analysis, non-yielding-analysis]
 ---
 
 # SQL-CSI: SQL Server Case Scene Investigation
@@ -21,11 +21,28 @@ investigation type has its own agent with full pipeline.
 |------|-------|-----------------|
 | **TSS Log 调查** | `tss-log-analysis` | "full analysis", "investigate case", "调查 case", "分析 log", provides case_dir with ERRORLOG/XEL |
 | **AG Failover 调查** | `ag-failover-analysis` | "AG failover", "AG databases stuck", "RESOLVING", "analyze AG", "分析 AG failover" |
+| **Non-yielding 调查** | `non-yielding-analysis` | "non-yielding scheduler/IOCP/resource monitor", "stalled dispatcher", 17883/17884/17887/17888, ERRORLOG + XEL |
 | **WPR Trace 调查** | `wpr-trace-analysis` | "analyze WPR", "analyze ETL", "CPU profiling", "non-yielding trace", provides `.etl` path |
 | *(future)* **Performance 调查** | `perf-analysis` *(planned)* | "performance", "slow query", "high CPU", "wait stats" |
 | *(future)* **Dump 调查** | `dump-analysis` *(planned expansion)* | "analyze dump", provides `.mdmp` / `.dmp` path |
 
 ## Single-Intent Routing
+
+### Non-yield entry-path rule
+
+- ERRORLOG/XEL case, or user asks to correlate non-yield with logs →
+   `non-yielding-analysis` (**Path 1**). It creates the log report first, then may hand a
+   matched dump to `dump-analysis`; Gate A/B/C are generated downstream and normally do not
+   exist at handoff time.
+- Direct `.mdmp`/`.dmp` input, or explicit "analyze dump" request without log correlation →
+   `dump-analysis` (**Path 2**). No upstream log report/receipt is required; it generates
+   Gate A → Gate B → Gate C itself.
+
+Do not route Path 1 directly to an existing Gate C report, and do not require Path 2 to run
+the log-analysis workflow first.
+
+For Path 1, publish the verified log-analysis report immediately when its Log Gate receipt is
+PASS. Do not hold that report until dump detection or downstream Gate A/B/C completes.
 
 For requests that don't need full investigation orchestration, route directly:
 
@@ -38,6 +55,7 @@ For requests that don't need full investigation orchestration, route directly:
 | "analyze dump", provides `.mdmp` / `.dmp` path | `dump-analysis` |
 | "search error XXXX", "find raising code" | `source-search` |
 | "latch timeout", "ACCESS_METHODS_DATASET_PARENT", "latch contention" | `latch-timeout-analysis` |
+| "non-yielding scheduler", "non-yielding IOCP", "stalled dispatcher", Errors 17883/17884/17887/17888 | `non-yielding-analysis` |
 | "analyze WPR", "analyze ETL", "CPU profiling", provides `.etl` path | `wpr-trace-analysis` |
 
 ## Entry Flow

@@ -278,7 +278,7 @@ Invoke this step automatically when **any** of these appear in the findings:
 ### 4.2 How to Invoke
 
 1. If a local SQL Server is available → `runSubagent("import-xevent")` to load the .xel
-   into `[xevent_analyze]`, then `runSubagent("analyze-xevent")` with the same
+  into `[xevent_<case_id>]`, then `runSubagent("analyze-xevent")` with the same
    `{window_start}`/`{window_end}` as the ERRORLOG incident window.
 2. If no local SQL Server → `runSubagent("analyze-xevent")` (Path B: PowerShell extract +
    `scripts/parse_xevent.js`).

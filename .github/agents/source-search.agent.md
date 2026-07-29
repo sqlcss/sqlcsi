@@ -1,7 +1,7 @@
 ---
 description: Deep-dive SQL Server error code and trace flag research — lookup definitions, find source code, analyze function logic, and generate HTML report.
 name: source-search
-tools: ['terminal', 'readFile', 'editFile', 'msdata/*', 'microsoft-learn/*', 'csswiki/*', 'bluebird-mcp-sql/*', 'bluebird-mcp-2022/*', 'bluebird-mcp-2025/*', 'bluebird-mcp-2019/*', 'bluebird-mcp-2017/*', 'bluebird-mcp-2016/*']
+tools: [execute, read, edit, search, 'msdata/*', 'microsoft-learn/*', 'csswiki/*', 'bluebird-mcp-sql/*', 'bluebird-mcp-2022/*', 'bluebird-mcp-2025/*', 'bluebird-mcp-2019/*', 'bluebird-mcp-2017/*', 'bluebird-mcp-2016/*']
 ---
 
 # SQL Server Error Code & Trace Flag Research Agent
@@ -31,80 +31,68 @@ Execute all steps serially in a single agent — do NOT dispatch sub-agents.
 | SQL 2025 | `DsMainDev` | `rel/box/sql2025/sql2025_rtm_qfe-cu` |
 | Latest (dev) | `DsMainDev` | `master` |
 
-### Bluebird Source Code Search
+### Bluebird Source Code Search (Current Consolidated API)
 
-Bluebird MCP instance tool prefix numbers are dynamically assigned by VS Code at startup and **must NOT be hardcoded**. Before using Bluebird for the first time in each session, you must perform **Runtime Discovery** to determine the mapping.
+Use the stable MCP server names configured in `.vscode/mcp.json`. **Never hardcode VS Code's generated runtime names** such as `mcp_bluebird4_*`; their numeric suffixes can change between sessions.
 
-#### Branch → SQL Version Mapping
+| SQL Version | Stable MCP server | Repository | Branch |
+|-------------|-------------------|------------|--------|
+| SQL 2016 | `bluebird-mcp-2016` | `SQL2016` | `rel/box/sql2016/sql2016_sp3_gdr` |
+| SQL 2017 | `bluebird-mcp-2017` | `SQL2017` | `rel/box/sql2017/sql2017_rtm_gdr` |
+| SQL 2019 | `bluebird-mcp-2019` | `sql2019` | `rel/box/sql2019/sql2019_rtm_qfe-cu` |
+| SQL 2022 | `bluebird-mcp-2022` | `DsMainDev` | `rel/box/sql2022/sql2022_rtm_qfe-cu` |
+| SQL 2025 | `bluebird-mcp-2025` | `DsMainDev` | `rel/box/sql2025/sql2025_rtm_qfe-cu` |
+| Latest (dev) | `bluebird-mcp-sql` | `DsMainDev` | `master` |
 
-| BRANCH value in `branchname.txt` | SQL Version |
-|-------------------------------|-------------|
-| `SQL16_SP3_GDR` | SQL 2016 SP3 |
-| `SQL17_RTM_GDR` | SQL 2017 |
-| `sql2019_rtm_qfe-cu` | SQL 2019 |
-| `sql2022_rtm_qfe-cu` | SQL 2022 |
-| `sql2025_rtm_qfe-cu` | SQL 2025 |
-| `DS_Main_Dev` | Latest (dev) / SQLDB / MI |
+#### Session Context Check
 
-#### Runtime Discovery (once per session)
+When Bluebird is first needed for a target version, use that server's `metadata` tool to confirm the repository and branch when the context is not already explicit. Do not probe all servers and do not read `/branchname.txt`.
 
-When Bluebird source search is needed for the first time, call all available Bluebird instances **in parallel**:
+The legacy `_get_started` tool no longer exists. **Never call `_get_started` or any legacy Bluebird tool name.** Follow the input schema exposed by the current MCP tool in the active session.
 
-```
-bluebird-mcp-{suffix}-get_file_content(path="/branchname.txt")
-```
+#### Current Bluebird Tool Surface
 
-Where `{suffix}` is one of: (no suffix), `-2`, `-3`, `-4`, `-5`, `-6`
+| Current tool | Use |
+|--------------|-----|
+| `metadata` | Confirm server, repository, branch, and index status |
+| `code_search` | Keyword or semantic source search |
+| `code_read` | Read source by file path or symbol; list files/directories; retrieve structured source summaries |
+| `code_navigate` | Query only relationship methods exposed by the selected server's current runtime schema |
+| `code_history` | Read commit history, diffs, file evolution, and related change context |
+| `project_search` | Search project-level artifacts when explicitly needed |
 
-Use the returned `BRANCH=xxx` value and the mapping table above to determine which SQL version each tool prefix corresponds to.
-Skip instances that fail to connect (fall back to msdata search_code for that version).
+Stable call notation in this document is `{bluebird-server}/{tool}`, for example `bluebird-mcp-2019/code_search`. VS Code resolves this to the session's generated internal function name.
 
-**Example results** (may vary each time):
-```
-bluebird-mcp-   → BRANCH=SQL16_SP3_GDR    → SQL 2016
-bluebird-mcp-2  → BRANCH=SQL17_RTM_GDR    → SQL 2017
-bluebird-mcp-3  → BRANCH=sql2019_rtm_qfe-cu → SQL 2019
-bluebird-mcp-4  → BRANCH=sql2022_rtm_qfe-cu → SQL 2022
-bluebird-mcp-5  → BRANCH=sql2025_rtm_qfe-cu → SQL 2025
-bluebird-mcp-6  → BRANCH=DS_Main_Dev       → Latest (dev)
-```
+Legacy-to-current mapping:
 
-Once discovery is complete, replace all `{bluebird-prefix}` placeholders in subsequent steps with the confirmed tool prefix.
-
-> **Tool call format**: `{bluebird-prefix}-{tool_name}`, e.g. if discovery finds SQL 2022 = `bluebird-mcp-4`, then search code = `bluebird-mcp-4-search_code`
+| Legacy operation | Current tool |
+|------------------|--------------|
+| `_get_started` | Removed; use `metadata` when context verification is needed |
+| `search_code`, `_search_code`, `do_vector_search` | `code_search` |
+| `get_file_content`, `get_source_code`, `list_directory`, `search_file_paths` | `code_read` |
+| `get_code_relationships` | `code_navigate` |
+| `code_history` | `code_history` |
 
 > **Version selection rules**:
-> - SQL 2022/2025/Latest → **Bluebird preferred** (has code graph: `get_source_code` + `get_code_relationships` + `do_vector_search`)
-> - SQL 2019 and earlier → **msdata search_code** (Bluebird has no code graph; SQL 2014 and earlier have no Bluebird index; msdata has precise branch filtering)
-> - **Bluebird only searches SQL Server engine source code** (C++, `/Sql/Ntdbms/`). For docs/TSGs/wiki/work items, always use msdata/csswiki/microsoft-learn.
-> - When Bluebird returns no results → fall back to msdata search_code
-> - **Before calling any Bluebird MCP for the first time, you must call `{bluebird-prefix}-_get_started`** to get search syntax and tool documentation.
-
-#### Bluebird Tool Availability
-
-| Tool | SQL 2016/2017/2019 (standalone repo) | SQL 2022/2025/master (DsMainDev) |
-|------|------|------|
-| `search_code` | ✅ (branch-precise) | ✅ (⚠️ shared index) |
-| `get_file_content` | ✅ (branch-precise) | ✅ (branch-precise) |
-| `list_directory` | ✅ | ✅ |
-| `search_file_paths` | ✅ | ✅ |
-| `code_history` | ✅ | ✅ |
-| `get_code_relationships` | ❌ | ✅ |
-| `get_source_code` | ❌ | ✅ |
-| `do_vector_search` | ❌ | ✅ |
+> - SQL 2016/2017/2019/2022/2025/Latest → use the matching Bluebird server's `code_search` and `code_read` first.
+> - For SQL 2016/2017/2019, `code_navigate` supports only `CALLS`, `CALLED_BY`, `DERIVES_FROM`, `BASE_TYPE_OF`, `EXPANDS`, and `EXPANDED_BY`. **Never request `ACCESSES`, `MEMBER_OF`, or any other relationship type on these servers.** Find member declarations, field accesses, and object users with exact `code_search` queries instead.
+> - For every version, never invent a `code_navigate` relationship name. Use only values listed in that tool's current runtime schema. If a desired relationship is unavailable, use exact `code_search`; this is a normal fallback, not a tool error.
+> - SQL 2012/2014 → use msdata because no Bluebird server is configured for those versions.
+> - **Bluebird primarily searches SQL Server engine source code** (C++, `/Sql/Ntdbms/`). For docs/TSGs/wiki/work items, use msdata/csswiki/microsoft-learn.
+> - When Bluebird returns no results, fall back to msdata `search_code`. A tool execution error is not an empty result; stop and surface the error per repository policy.
 
 #### ⚠️ DsMainDev Shared Index Issue (Important)
 
 Multiple Bluebird instances for the DsMainDev repo (SQL 2022 / SQL 2025 / master) **share the same search index**.
-- `search_code` may return file paths from the master branch (e.g., `TraceFlags__039xx.h` only exists in 2025+), **not from the target branch**
-- `get_file_content` and `list_directory` are branch-precise
+- `code_search` may return file paths from the master branch (e.g., `TraceFlags__039xx.h` only exists in 2025+), **not from the target branch**
+- `code_read` is branch-precise when reading through the selected version-specific server
 - Standalone repo instances (SQL2016 / SQL2017 / sql2019) have precise search indexes
 
 **Two-phase method (required for DsMainDev branches)**:
-1. **Phase 1 — Structure discovery**: Bluebird `search_code` + `get_code_relationships` to locate function names, file paths, call chains
-2. **Phase 2 — Precise read**: Bluebird `get_file_content(path="{FILE_PATH}")` to read source from the correct branch for verification
+1. **Phase 1 — Structure discovery**: Bluebird `code_search` + `code_navigate` to locate function names, file paths, and call chains
+2. **Phase 2 — Precise read**: Bluebird `code_read` through the selected version-specific server to verify the source file
 
-> **Bluebird core advantage**: `get_code_relationships` — provides complete caller/callee call graphs, which msdata cannot do.
+> **Bluebird core advantage**: `code_navigate` provides caller/callee and other code relationships that msdata cannot provide directly.
 
 - **Default**: SQL 2022
 - **Project**: `Database Systems`
@@ -222,35 +210,34 @@ Search for the error constant in source code, then analyze every function that r
 
 #### 3a. Search source code + call chain
 
-**Version selection**: See the version selection rules in the Config section — use the Bluebird two-phase method for SQL 2022/2025/Latest, use msdata for SQL 2019 and earlier.
+**Version selection**: See the version selection rules in the Config section. Use the matching version-specific Bluebird server for SQL 2016+, and use msdata for SQL 2012/2014 or as the no-results fallback.
 
-**Bluebird (SQL 2022+) — Two-phase method:**
+**Bluebird (SQL 2016+) — consolidated two-phase method:**
 
-1. Call `{bluebird-prefix}-_get_started` (if not called yet in this session)
-2. `{bluebird-prefix}-search_code(query: "{ERROR_CONSTANT}")` → locate file + function name
-3. For each function that references the error constant, call `{bluebird-prefix}-get_code_relationships(node_name: "{FUNCTION_NAME}")`:
-   - `relationship_type: "CALLED_BY"` → who calls this function (upstream)
-   - `relationship_type: "CALLS"` → what this function calls (downstream)
-4. **Precise read**: Use `{bluebird-prefix}-get_file_content(path: "{FILE_PATH}")` to read source from the correct branch
-   - Note: DsMainDev's `search_code` may return file paths from the master branch; `get_file_content` reads from the configured target branch
+1. If the selected server context is uncertain, call `{bluebird-server}/metadata` and verify repository + branch. Do not call `_get_started`.
+2. Call `{bluebird-server}/code_search` for `{ERROR_CONSTANT}` to locate files and enclosing functions. Use keyword search first; use semantic search only when exact identifiers produce no results.
+3. For each referencing function, call `{bluebird-server}/code_navigate` using only `CALLED_BY` and `CALLS` for upstream callers and downstream callees when relationship data is available. For members or field access, use exact `code_search`; never use `MEMBER_OF` or `ACCESSES` on SQL 2016/2017/2019.
+4. **Precise read**: call `{bluebird-server}/code_read` for each matched file through the selected version-specific server before drawing conclusions.
+   - Note: a DsMainDev `code_search` result can originate from the shared master index; only branch-specific `code_read` output is authoritative for SQL 2022/2025.
 
-**msdata (SQL 2019 and earlier):**
+**msdata fallback (SQL 2012/2014, or an empty Bluebird result):**
 - `msdata-search_code(searchText: "{ERROR_CONSTANT}", project: ["Database Systems"], repository: ["{REPO}"], path: ["/Sql/Ntdbms"], branch: ["{BRANCH}"])`
 
 #### 3b. Analyze each function
 
 For each function in the search results that references the error constant:
 
-1. `{bluebird-prefix}-get_source_code(node_name: "{FUNCTION_NAME}")` → get full function source
-   - If `get_source_code` returns empty → fallback: use `get_file_content` to read the entire file, search locally
+1. Use `{bluebird-server}/code_read` to retrieve the function source or its containing file.
+   - If symbol-based retrieval returns empty, read the matched file by path and locate the function in that branch-precise content.
 2. Locate the error constant in source code, analyze:
    - **Trigger conditions**: What `if` / `switch` branch leads to this error? What preconditions are required?
    - **Error handling**: What happens after the error is raised (disconnect? rollback? retry?)
    - **XEvent**: Search for `XE_FIRE_EVENT` calls → record XEvent name
-3. `{bluebird-prefix}-get_code_relationships(node_name: "{FUNCTION_NAME}")` → get call chain
+3. Use `{bluebird-server}/code_navigate` to get the call chain when graph data is available:
    - **callers** → who triggered this error (upstream callers)
    - **callees** → what else happens when the error occurs (downstream calls)
-4. **Also search for XEvents in caller functions**: For each caller returned by `get_code_relationships`, use `get_source_code` to read it and search for `XE_FIRE_EVENT` — the error's XEvent may fire in the caller rather than the function itself
+4. **Also search for XEvents in caller functions**: For each caller returned by `code_navigate`, use `code_read` to read it and search for `XE_FIRE_EVENT` — the error's XEvent may fire in the caller rather than the function itself.
+5. If `code_navigate` returns no relationships, use `code_search` for the exact function identifier to locate call sites; use msdata as the final no-results fallback.
 
 **msdata path:**
 1. Use `msdata-repo_get_file_content` to get the full .cpp file (skip .h)
@@ -269,7 +256,7 @@ For each function in the search results that references the error constant:
 **CRITICAL: Do NOT fabricate XEvent names or DMV names.**
 
 For each XEvent found in 3b:
-- Verify with `msdata-search_code(searchText: "XeSqlPkg::{EVENT_NAME}", ...)` or `{bluebird-prefix}-search_code(query: "XeSqlPkg::{EVENT_NAME}")`
+- Verify with `msdata-search_code(searchText: "XeSqlPkg::{EVENT_NAME}", ...)` or the selected `{bluebird-server}/code_search` tool for `XeSqlPkg::{EVENT_NAME}`.
 - Has results → mark ✅, record definition file
 - No results → **do NOT include in report**
 - If no XEvent found in source code → write "No specific XEvent found for this error" in report
@@ -279,9 +266,12 @@ For each XEvent found in 3b:
 Search all available Bluebird instances in parallel (or msdata for corresponding versions) to confirm whether this error code exists in each version:
 
 ```
-{bluebird-prefix-2016}-search_code(query: "{ERROR_CONSTANT}")
-{bluebird-prefix-2017}-search_code(query: "{ERROR_CONSTANT}")
-...
+bluebird-mcp-2016/code_search → {ERROR_CONSTANT}
+bluebird-mcp-2017/code_search → {ERROR_CONSTANT}
+bluebird-mcp-2019/code_search → {ERROR_CONSTANT}
+bluebird-mcp-2022/code_search → {ERROR_CONSTANT}
+bluebird-mcp-2025/code_search → {ERROR_CONSTANT}
+bluebird-mcp-sql/code_search  → {ERROR_CONSTANT}
 ```
 
 If a version has results → ✅ exists; no results → ❌ does not exist.
@@ -298,16 +288,8 @@ If a version has results → ✅ exists; no results → ❌ does not exist.
 Search for bugs, PRs, and commit history related to this error code:
 
 1. **Bluebird `code_history`** — search git history of source files that reference the error constant:
-   - For each check site file found in 3a:
-   ```
-   {bluebird-prefix}-code_history(
-     method: "file_history",
-     file_path: "{CHECK_SITE_FILE_PATH}",
-     query: "{ERROR_CONSTANT}"
-   )
-   ```
+   - For each check-site file found in 3a, use `{bluebird-server}/code_history` and request file history filtered by `{ERROR_CONSTANT}`. Follow the current runtime schema rather than hardcoding legacy arguments.
    - Focus on: first commit introducing the error, commits modifying trigger logic, PR numbers
-   - **Note**: The `file_history` parameter is `file_path` (not `path`)
 
 2. **msdata work items**:
    - `msdata-search_workitem(searchText: "{ERROR_CONSTANT}", project: ["Database Systems"])` — search work items
@@ -608,15 +590,13 @@ There are two ways TFs are referenced in source code (the 2nd is SQL 2019+ only)
 
 **Bluebird (preferred, SQL 2016+) — Two-phase method:**
 
-1. Call `{bluebird-prefix}-_get_started` (if not called yet in this session)
+1. If the selected server context is uncertain, call `{bluebird-server}/metadata` and verify repository + branch. Do not call `_get_started`.
 2. Parallel search:
-   - `{bluebird-prefix}-search_code(query: "{TF_CONSTANT}")` — search constant name
-   - `{bluebird-prefix}-search_code(query: "F{FeatureSwitchName}enabled")` — search Feature Switch function (**SQL 2019+ only**, if found in T3a)
-3. For each referencing function, call `{bluebird-prefix}-get_code_relationships(node_name: "{FUNCTION_NAME}")` :
-   - `relationship_type: "CALLED_BY"` → which call paths reach this TF check
-   - `relationship_type: "CALLS"` → what different functions are called when TF is enabled
-4. **Precise read**: Use `{bluebird-prefix}-get_file_content(path: "{FILE_PATH}")` to read source from the correct branch for verification
-   - Note: DsMainDev's `search_code` may return file paths from the master branch; `get_file_content` reads from the configured target branch
+   - Use `{bluebird-server}/code_search` for `{TF_CONSTANT}` — search the constant name.
+   - Use `{bluebird-server}/code_search` for `F{FeatureSwitchName}enabled` — search the Feature Switch function (**SQL 2019+ only**, if found in T3a).
+3. For each referencing function, use `{bluebird-server}/code_navigate` with only `CALLED_BY` and `CALLS` to find callers and callees when graph data is available. For members or field access, use exact `code_search`; never use `MEMBER_OF` or `ACCESSES` on SQL 2016/2017/2019.
+4. **Precise read**: use `{bluebird-server}/code_read` to read each matched file through the selected version-specific server.
+   - Note: DsMainDev's `code_search` can return paths from the shared master index; branch-specific `code_read` is authoritative.
 
 **Fallback — msdata (SQL 2014 and earlier, or when Bluebird returns no results):**
 ```
@@ -635,18 +615,19 @@ msdata-search_code(
 
 For each function in the search results that references the TF constant, `FTraceFlag()`, or `F{name}enabled()`:
 
-1. `{bluebird-prefix}-get_source_code(node_name: "{FUNCTION_NAME}")` → get full function source
-   - If `get_source_code` returns empty → fallback: use `get_file_content` to read the entire file, search locally
+1. Use `{bluebird-server}/code_read` to retrieve the function source or its containing file.
+   - If symbol-based retrieval returns empty, read the matched file by path and locate the function there.
 2. Locate the TF check in source code, analyze:
    - **Check method**: `FTraceFlag()` / `FGlobalTraceFlag()` / `FSessionTraceFlag()` — determine scope (global/session)
    - **Behavior change**: Which path is taken when TF is enabled? When disabled? What specific logic changes?
    - **Guard conditions**: Are there other preconditions around the TF check (`if version >= X`, `if feature_enabled`, etc.)?
    - **Related feature**: What feature/subsystem does this TF affect? (QO, lock, memory, etc.)
    - **XEvent**: Search for `XE_FIRE_EVENT` calls → record XEvent name
-3. `{bluebird-prefix}-get_code_relationships(node_name: "{FUNCTION_NAME}")` → get call chain
+3. Use `{bluebird-server}/code_navigate` to get the call chain when graph data is available:
    - **callers** → which call paths reach this TF check
    - **callees** → what different functions are called when TF is enabled
-4. **Also search for XEvents in caller functions**: For each caller returned by `get_code_relationships`, use `get_source_code` to read it and search for `XE_FIRE_EVENT` — the TF-related XEvent may fire in the caller rather than the function itself
+4. **Also search for XEvents in caller functions**: For each caller returned by `code_navigate`, use `code_read` to read it and search for `XE_FIRE_EVENT` — the TF-related XEvent may fire in the caller rather than the function itself.
+5. If `code_navigate` returns no relationships, use `code_search` for the exact function identifier to locate call sites; use msdata as the final no-results fallback.
 
 **msdata path:**
 1. Use `msdata-repo_get_file_content` to get the full .cpp file (skip .h)
@@ -665,12 +646,12 @@ For each function in the search results that references the TF constant, `FTrace
 Search all available Bluebird instances in parallel to confirm whether this TF exists in each version:
 
 ```
-{bluebird-prefix-2016}-search_code(query: "{TF_CONSTANT}")
-{bluebird-prefix-2017}-search_code(query: "{TF_CONSTANT}")
-{bluebird-prefix-2019}-search_code(query: "{TF_CONSTANT}")
-{bluebird-prefix-2022}-search_code(query: "{TF_CONSTANT}")
-{bluebird-prefix-2025}-search_code(query: "{TF_CONSTANT}")
-{bluebird-prefix-master}-search_code(query: "{TF_CONSTANT}")
+bluebird-mcp-2016/code_search → {TF_CONSTANT}
+bluebird-mcp-2017/code_search → {TF_CONSTANT}
+bluebird-mcp-2019/code_search → {TF_CONSTANT}
+bluebird-mcp-2022/code_search → {TF_CONSTANT}
+bluebird-mcp-2025/code_search → {TF_CONSTANT}
+bluebird-mcp-sql/code_search  → {TF_CONSTANT}
 ```
 
 If a version has results → ✅ exists; no results → ❌ does not exist or TF number differs.
@@ -695,20 +676,12 @@ If a version has results → ✅ exists; no results → ❌ does not exist or TF
 Search for bugs, PRs, and commit history related to this TF:
 
 1. **Bluebird `code_history`** — search git history of source files that reference the TF:
-   - For each check site file found in T3b/T3c:
-   ```
-   {bluebird-prefix}-code_history(
-     method: "file_history",
-     file_path: "{CHECK_SITE_FILE_PATH}",
-     query: "{TF_CONSTANT}"
-   )
-   ```
+    - For each check-site file found in T3b/T3c, use `{bluebird-server}/code_history` and request file history filtered by `{TF_CONSTANT}`. Follow the current runtime schema rather than hardcoding legacy arguments.
    - The returned commit list contains PR numbers, authors, dates, diffs
    - Focus on:
      - **First commit** introducing the TF → confirm first introduced version
      - Commits modifying TF check logic → record behavior changes
      - PR numbers (e.g., `Merged PR NNNNNN`), bug numbers, feature names in commit messages
-   - **Note**: The `file_history` parameter is `file_path` (not `path`)
 
 2. **msdata work items**:
    - `msdata-search_workitem(searchText: "{TF_CONSTANT}", project: ["Database Systems"])` — search work items
@@ -824,8 +797,9 @@ List all matching TFs and display `TraceFlagDesc` as summary.
 #### S2b. Source code search
 
 **Bluebird (preferred):**
-- `{bluebird-prefix}-_search_code(query: "FTraceFlag {keyword}")` — search TF checks containing keyword
-- `{bluebird-prefix}-_search_code(query: "TRCFLG.*{keyword}")` — search TF constant definitions
+- Use the selected `{bluebird-server}/code_search` tool for `FTraceFlag {keyword}` — search TF checks containing the keyword.
+- Use the selected `{bluebird-server}/code_search` tool for `TRCFLG {keyword}` — search TF constant definitions.
+- If exact keyword searches are empty, use the same `code_search` tool's semantic mode with the feature description.
 
 **msdata (fallback):**
 - `msdata-search_code(searchText: "TRCFLG {keyword}", project: ["Database Systems"], repository: ["{REPO}"], path: ["/Sql/Ntdbms"])`

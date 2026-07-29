@@ -53,12 +53,13 @@ function StateTag([string]$state) {
         'RUNNING'   { '<span class="tag t-run">RUNNING</span>' }
         'RUNNABLE'  { '<span class="tag t-rbl">RUNNABLE</span>' }
         'SUSPENDED' { '<span class="tag t-sus">SUSPENDED</span>' }
+        'PENDING'   { '<span class="tag t-idle">PENDING</span>' }
         'DONE'      { '<span class="tag t-idle">DONE</span>' }
         default     { "<span class=""tag t-idle"">$(HE $state)</span>" }
     }
 }
 
-$stateOrder = @('SUSPENDED','RUNNABLE','RUNNING','DONE')
+$stateOrder = @('SUSPENDED','RUNNABLE','RUNNING','PENDING','DONE')
 $totalBound = [int]$s.totalBound
 
 # ---- 表 2 -------------------------------------------------------------------
@@ -88,14 +89,14 @@ Write-Host "OK: wrote $Out2"
 # ---- 表 3 -------------------------------------------------------------------
 $sb3 = New-Object System.Text.StringBuilder
 [void]$sb3.Append('<h3>表 3 · 按调度器分布（Tasks.Enumerate 按 SchedulerId 透视 · 纯计数）</h3>')
-[void]$sb3.Append('<table><thead><tr><th class="num">调度器</th><th class="num">总数</th><th class="num">SUSPENDED</th><th class="num">RUNNABLE</th><th class="num">RUNNING</th><th class="num">DONE</th></tr></thead><tbody>')
+[void]$sb3.Append('<table><thead><tr><th class="num">调度器</th><th class="num">总数</th><th class="num">SUSPENDED</th><th class="num">RUNNABLE</th><th class="num">RUNNING</th><th class="num">PENDING</th><th class="num">DONE</th></tr></thead><tbody>')
 foreach ($v in $s.schedulerPivot.visible) {
-    [void]$sb3.Append("<tr><td class=""num"">$($v.id)</td><td class=""num"">$($v.total)</td><td class=""num"">$($v.SUSPENDED)</td><td class=""num"">$($v.RUNNABLE)</td><td class=""num"">$($v.RUNNING)</td><td class=""num"">$($v.DONE)</td></tr>")
+    [void]$sb3.Append("<tr><td class=""num"">$($v.id)</td><td class=""num"">$($v.total)</td><td class=""num"">$($v.SUSPENDED)</td><td class=""num"">$($v.RUNNABLE)</td><td class=""num"">$($v.RUNNING)</td><td class=""num"">$($v.PENDING)</td><td class=""num"">$($v.DONE)</td></tr>")
 }
 $h = $s.schedulerPivot.hidden
-[void]$sb3.Append("<tr><td class=""num"">隐藏/系统 (id&ge;1048576)</td><td class=""num"">$($h.total)</td><td class=""num"">$($h.SUSPENDED)</td><td class=""num"">$($h.RUNNABLE)</td><td class=""num"">$($h.RUNNING)</td><td class=""num"">$($h.DONE)</td></tr>")
+[void]$sb3.Append("<tr><td class=""num"">隐藏/系统 (id&ge;1048576)</td><td class=""num"">$($h.total)</td><td class=""num"">$($h.SUSPENDED)</td><td class=""num"">$($h.RUNNABLE)</td><td class=""num"">$($h.RUNNING)</td><td class=""num"">$($h.PENDING)</td><td class=""num"">$($h.DONE)</td></tr>")
 $t = $s.schedulerPivot.total
-[void]$sb3.Append("<tr><td><b>合计</b></td><td class=""num""><b>$($t.total)</b></td><td class=""num""><b>$($t.SUSPENDED)</b></td><td class=""num""><b>$($t.RUNNABLE)</b></td><td class=""num""><b>$($t.RUNNING)</b></td><td class=""num""><b>$($t.DONE)</b></td></tr>")
+[void]$sb3.Append("<tr><td><b>合计</b></td><td class=""num""><b>$($t.total)</b></td><td class=""num""><b>$($t.SUSPENDED)</b></td><td class=""num""><b>$($t.RUNNABLE)</b></td><td class=""num""><b>$($t.RUNNING)</b></td><td class=""num""><b>$($t.PENDING)</b></td><td class=""num""><b>$($t.DONE)</b></td></tr>")
 [void]$sb3.Append('</tbody></table>')
 
 $outDir3 = Split-Path -Parent $Out3

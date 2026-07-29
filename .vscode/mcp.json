@@ -54,6 +54,11 @@
       "type": "http",
       "url": "https://sqlops-mcp-test.azurewebsites.net"
     },
+    "WinDbg": {
+      "type": "stdio",
+      "command": "C:\\Users\\lduan\\AppData\\Local\\Microsoft\\WindowsApps\\Microsoft.WinDbg.Slow_8wekyb3d8bbwe\\DbgX.Mcp.Proxy.exe",
+      "args": []
+    },
     "bluebird-mcp-sql": {
       "type": "http",
       "url": "https://mcp.bluebird-ai.net/",
