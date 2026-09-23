@@ -4,7 +4,7 @@ description: >-
   Parse SQL Server ERRORLOG files to extract errors, build timelines, and detect patterns.
   Use when the user says "analyze errorlog", "parse errorlog", "分析 errorlog", provides
   a path to an ERRORLOG file, or says "what errors are in this log".
-tools: ['terminal', 'readFile', 'editFile']
+tools: [execute, read, edit, search, agent]
 agents: [import-xevent, analyze-xevent]
 ---
 
